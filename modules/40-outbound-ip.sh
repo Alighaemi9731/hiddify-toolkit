@@ -223,12 +223,12 @@ _oip_rules_delete() {                    # <iface> <primary> <chosen>
   [ -n "$ifc" ] && [ -n "$pri" ] && [ -n "$ch" ] || return 0
   # Loops, not single deletes: a half-finished earlier run can leave duplicates,
   # and `-D` removes one copy per call.
-  while iptables -t nat -C POSTROUTING -o "$ifc" -s "$pri" -j SNAT --to-source "$ch" 2>/dev/null; do
-    iptables -t nat -D POSTROUTING -o "$ifc" -s "$pri" -j SNAT --to-source "$ch" 2>/dev/null || break
+  while iptables -w 5 -t nat -C POSTROUTING -o "$ifc" -s "$pri" -j SNAT --to-source "$ch" 2>/dev/null; do
+    iptables -w 5 -t nat -D POSTROUTING -o "$ifc" -s "$pri" -j SNAT --to-source "$ch" 2>/dev/null || break
   done
   for c in "${_OIP_PRIV[@]}"; do
-    while iptables -t nat -C POSTROUTING -o "$ifc" -s "$pri" -d "$c" -j RETURN 2>/dev/null; do
-      iptables -t nat -D POSTROUTING -o "$ifc" -s "$pri" -d "$c" -j RETURN 2>/dev/null || break
+    while iptables -w 5 -t nat -C POSTROUTING -o "$ifc" -s "$pri" -d "$c" -j RETURN 2>/dev/null; do
+      iptables -w 5 -t nat -D POSTROUTING -o "$ifc" -s "$pri" -d "$c" -j RETURN 2>/dev/null || break
     done
   done
   return 0
@@ -243,9 +243,9 @@ _oip_rules_install() {                   # <iface> <primary> <chosen>
   # shadowed rule still answers `-C` with "present", so nothing ever self-heals.
   # SNAT goes in first and each RETURN is pushed in above it, so the finished
   # block is [RETURN x5][SNAT] at the top of the chain.
-  iptables -t nat -I POSTROUTING 1 -o "$ifc" -s "$pri" -j SNAT --to-source "$ch" 2>/dev/null || return 1
+  iptables -w 5 -t nat -I POSTROUTING 1 -o "$ifc" -s "$pri" -j SNAT --to-source "$ch" 2>/dev/null || return 1
   for c in "${_OIP_PRIV[@]}"; do
-    iptables -t nat -I POSTROUTING 1 -o "$ifc" -s "$pri" -d "$c" -j RETURN 2>/dev/null || return 1
+    iptables -w 5 -t nat -I POSTROUTING 1 -o "$ifc" -s "$pri" -d "$c" -j RETURN 2>/dev/null || return 1
   done
   return 0
 }
@@ -304,7 +304,7 @@ _oip_rules_scan() {                      # <iface> <primary> <chosen>
         break
       fi
     done
-  done < <(iptables -t nat -S POSTROUTING 2>/dev/null)
+  done < <(iptables -w 5 -t nat -S POSTROUTING 2>/dev/null)
   return 0
 }
 
@@ -343,16 +343,16 @@ _oip_purge_foreign_snat() {              # <iface> <primary> <chosen>
     [[ " $l " == *" --to-source $ch "* ]] && continue
     read -r -a parts <<<"$l"
     parts[0]="-D"
-    if iptables -t nat "${parts[@]}" 2>/dev/null; then
+    if iptables -w 5 -t nat "${parts[@]}" 2>/dev/null; then
       removed=$((removed + 1))
     else
       # Word-splitting a rule that carries `-m comment --comment "two words"` yields
       # tokens iptables will not take back, and the -D fails. Say so. Counting zero
       # and moving on leaves exactly the silent stale SNAT this function exists to
       # stop, and revert would later hand the box to it.
-      warn "could not delete a stale SNAT — remove it by hand: iptables -t nat -D ${l#-A }"
+      warn "could not delete a stale SNAT — remove it by hand: iptables -w 5 -t nat -D ${l#-A }"
     fi
-  done < <(iptables -t nat -S POSTROUTING 2>/dev/null)
+  done < <(iptables -w 5 -t nat -S POSTROUTING 2>/dev/null)
   [ "$removed" -gt 0 ] && warn "removed $removed stale SNAT rule(s) that also rewrote $pri"
   return 0
 }
@@ -364,9 +364,9 @@ _oip_purge_foreign_snat() {              # <iface> <primary> <chosen>
 _oip_own_rules_present() {               # <iface> <primary> <chosen>
   local ifc="${1:-}" pri="${2:-}" ch="${3:-}" c
   [ -n "$ifc" ] && [ -n "$pri" ] && [ -n "$ch" ] || return 1
-  iptables -t nat -C POSTROUTING -o "$ifc" -s "$pri" -j SNAT --to-source "$ch" 2>/dev/null && return 0
+  iptables -w 5 -t nat -C POSTROUTING -o "$ifc" -s "$pri" -j SNAT --to-source "$ch" 2>/dev/null && return 0
   for c in "${_OIP_PRIV[@]}"; do
-    iptables -t nat -C POSTROUTING -o "$ifc" -s "$pri" -d "$c" -j RETURN 2>/dev/null && return 0
+    iptables -w 5 -t nat -C POSTROUTING -o "$ifc" -s "$pri" -d "$c" -j RETURN 2>/dev/null && return 0
   done
   return 1
 }
@@ -388,8 +388,8 @@ _oip_purge_legacy_rules() {              # <iface>
   [ -n "$ifc" ] && [ "$ifc" != "eth0" ] && devs+=("$ifc")
   for d in "${devs[@]}"; do
     for c in "${_OIP_PRIV[@]}"; do
-      while iptables -t nat -C POSTROUTING -o "$d" -d "$c" -j RETURN 2>/dev/null; do
-        iptables -t nat -D POSTROUTING -o "$d" -d "$c" -j RETURN 2>/dev/null || break
+      while iptables -w 5 -t nat -C POSTROUTING -o "$d" -d "$c" -j RETURN 2>/dev/null; do
+        iptables -w 5 -t nat -D POSTROUTING -o "$d" -d "$c" -j RETURN 2>/dev/null || break
         n=$((n + 1))
       done
     done
@@ -607,7 +607,7 @@ mod_apply() {
      { [ "$prev" != "$ch" ] || [ "$prev_pri" != "$pri" ] || [ "$prev_ifc" != "$ifc" ]; }; then
     _oip_rules_delete "$prev_ifc" "$prev_pri" "$prev"
     # Only an address WE added, and never one that is somebody's primary.
-    if [ "$prev" != "$ch" ] && [ "$(ht_conf_get addr_added no)" = "yes" ] &&
+    if [ "$prev" != "$ch" ] && [ "$(ht_conf_get added_addr "")" = "$prev" ] &&
        [ "$prev" != "$prev_pri" ] && [ "$prev" != "$pri" ] && _oip_addr_present "$prev"; then
       if ip addr del "$prev/32" dev "$(_oip_addr_iface "$prev")" 2>/dev/null; then
         ok "removed the previously chosen $prev/32 (this module had added it)"
@@ -638,6 +638,10 @@ mod_apply() {
   # Only an address WE added may ever be removed on revert. Deleting one that came
   # from netplan would take the box off the network on the next reboot-less revert.
   ht_conf_set addr_added "$added"
+  # By VALUE, not as a flag: this is what lets a later apply/revert know exactly which
+  # address this module put on the interface, even when the operator re-runs through
+  # the conf-edit route and `prev` therefore equals `ch`.
+  if [ "$added" = "yes" ]; then ht_conf_set added_addr "$ch"; fi
 
   _oip_purge_foreign_snat "$ifc" "$pri" "$ch"
   if ! _oip_rules_install "$ifc" "$pri" "$ch"; then
@@ -722,7 +726,7 @@ mod_revert() {
     _oip_rules_delete "${OIP_LIVE_IFACE:-$OIP_IFACE}" "$OIP_LIVE_PRIMARY" "$OIP_CHOSEN"
   fi
 
-  if [ "$(ht_conf_get addr_added no)" = "yes" ] &&
+  if [ "$(ht_conf_get added_addr "")" = "$(ht_conf_get outbound_ip "")" ] &&
      [ "$OIP_CHOSEN" != "$OIP_PRIMARY" ] && _oip_addr_present "$OIP_CHOSEN"; then
     if ip addr del "$OIP_CHOSEN/32" dev "$(_oip_addr_iface "$OIP_CHOSEN")" 2>/dev/null; then
       ok "removed $OIP_CHOSEN/32 (this module had added it)"
@@ -731,6 +735,7 @@ mod_revert() {
     fi
   fi
   ht_conf_set addr_added no
+  ht_conf_set added_addr ""
 
   # Established flows keep their existing translation until they expire; `conntrack
   # -F` on a live VPN exit would drop every customer session to tidy up a table
@@ -742,7 +747,7 @@ mod_revert() {
     else
       warn "nat rules of our shape survived, but none of them is ours to spec-delete"
     fi
-    warn "inspect and clear by hand: iptables -t nat -S POSTROUTING"
+    warn "inspect and clear by hand: iptables -w 5 -t nat -S POSTROUTING"
     ht_log "[$MOD_ID] revert left rules behind in nat/POSTROUTING"
     # And still SUCCESS, deliberately. Everything this module can remove IS removed.
     # Returning non-zero makes bin/hiddify-toolkit skip ht_mark_disabled, so the module

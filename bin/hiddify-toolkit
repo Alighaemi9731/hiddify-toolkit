@@ -4,7 +4,7 @@
 #
 #   hiddify-toolkit                 interactive menu
 #   hiddify-toolkit status          state of every module
-#   hiddify-toolkit apply  <id>     apply one module (non-interactive)
+#   hiddify-toolkit apply  <id>     apply one module (may prompt; see the module)
 #   hiddify-toolkit revert <id>     undo one module
 #   hiddify-toolkit reassert        re-apply enabled modules (the guard timer calls this)
 #   hiddify-toolkit update          pull the newest toolkit, keep state
