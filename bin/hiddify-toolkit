@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# =============================================================================
+# hiddify-toolkit — one menu for every Hiddify panel-server fix
+#
+#   hiddify-toolkit                 interactive menu
+#   hiddify-toolkit status          state of every module
+#   hiddify-toolkit apply  <id>     apply one module (non-interactive)
+#   hiddify-toolkit revert <id>     undo one module
+#   hiddify-toolkit reassert        re-apply enabled modules (the guard timer calls this)
+#   hiddify-toolkit update          pull the newest toolkit, keep state
+#   hiddify-toolkit uninstall       revert everything and remove the toolkit
+# =============================================================================
+set -uo pipefail
+
+HT_ROOT="${HT_ROOT:-/opt/hiddify-toolkit}"
+# Allow running straight out of a git checkout for development.
+if [ ! -f "$HT_ROOT/lib/core.sh" ]; then
+  _self="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  [ -f "$_self/lib/core.sh" ] && HT_ROOT="$_self"
+fi
+# shellcheck source=lib/core.sh
+. "$HT_ROOT/lib/core.sh" || { echo "cannot load core.sh from $HT_ROOT" >&2; exit 1; }
+
+HT_REPO_RAW="https://raw.githubusercontent.com/Alighaemi9731/hiddify-toolkit/main"
+
+version() { cat "$HT_ROOT/VERSION" 2>/dev/null || echo "unknown"; }
+
+# ------------------------------------------------------------------ header ---
+_hiddify_version() {
+  [ -f /opt/hiddify-manager/VERSION ] && tr -d '\n' < /opt/hiddify-manager/VERSION || echo "not installed"
+}
+
+banner() {
+  local os; os="$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+  printf '\n'
+  say "  hiddify-toolkit v$(version)"
+  dim  "  $(hostname)  ·  ${os:-unknown}  ·  Hiddify $(_hiddify_version)"
+  printf '\n'
+}
+
+_state_label() {
+  local c t
+  case "$1" in
+    APPLIED) c="$_C_OK";   t="● applied" ;;
+    ABSENT)  c="$_C_DIM";  t="○ off"     ;;
+    PARTIAL) c="$_C_WARN"; t="◐ partial" ;;
+    *)       c="$_C_ERR";  t="? unknown" ;;
+  esac
+  printf '%s%-9s%s' "$c" "$t" "$_C_OFF"
+}
+
+# ------------------------------------------------------------------ actions --
+do_apply() {
+  local file="$1" id title
+  IFS='|' read -r id title _ _ _ < <(ht_module_meta "$file")
+  say "=== apply: $title ==="
+  if ! ht_module_run "$file" mod_apply; then
+    err "apply failed — nothing was enabled"; ht_log "apply FAILED $id"; return 1
+  fi
+  if ht_module_run "$file" mod_verify; then
+    ht_mark_enabled "$id"; ht_guard_sync
+    ok "applied and verified"; ht_log "apply OK $id"
+    return 0
+  fi
+  # Verification is the safety net: a change that did not do what it claimed is
+  # rolled straight back rather than left half-live on a production box.
+  err "verification FAILED — rolling back"
+  ht_module_run "$file" mod_revert >/dev/null 2>&1
+  ht_mark_disabled "$id"; ht_guard_sync
+  ht_log "apply ROLLED BACK $id"
+  return 1
+}
+
+do_revert() {
+  local file="$1" id title
+  IFS='|' read -r id title _ _ _ < <(ht_module_meta "$file")
+  say "=== revert: $title ==="
+  if ht_module_run "$file" mod_revert; then
+    ht_mark_disabled "$id"; ht_guard_sync
+    ok "reverted"; ht_log "revert OK $id"; return 0
+  fi
+  err "revert reported a problem"; ht_log "revert FAILED $id"; return 1
+}
+
+do_status() {
+  banner
+  printf '   %-3s %-9s   %s\n' "#" "state" "module"
+  printf '   %s\n' "$(printf '─%.0s' $(seq 1 66))"
+  local n=0 f id title st
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    n=$((n + 1))
+    IFS='|' read -r id title _ _ _ < <(ht_module_meta "$f")
+    st="$(ht_module_state "$f")"
+    printf '   %-3s %b   %s\n' "$n" "$(_state_label "$st")" "$title"
+  done < <(ht_module_files)
+  printf '\n'
+  local g; g="$(systemctl is-active hiddify-toolkit-guard.timer 2>/dev/null)"
+  dim "   guard timer: ${g:-inactive}   (re-applies enabled modules every 2 min)"
+  printf '\n'
+}
+
+do_status_verbose() {
+  local f title
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    IFS='|' read -r _ title _ _ _ < <(ht_module_meta "$f")
+    say "--- $title"
+    ht_module_run "$f" mod_status | sed 's/^/    /'
+    printf '\n'
+  done < <(ht_module_files)
+}
+
+do_reassert() {
+  local f id guard rc=0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    IFS='|' read -r id _ _ guard _ < <(ht_module_meta "$f")
+    [ "$guard" = "yes" ] || continue
+    ht_is_enabled "$id" || continue
+    ht_module_run "$f" mod_reassert >/dev/null 2>&1 || { rc=1; ht_log "reassert FAILED $id"; }
+  done < <(ht_module_files)
+  return $rc
+}
+
+do_update() {
+  need_root
+  say "=== updating toolkit from GitHub ==="
+  local tmp; tmp="$(mktemp -d)"
+  if ! curl -fsSL "$HT_REPO_RAW/install.sh" -o "$tmp/install.sh"; then
+    err "download failed"; rm -rf "$tmp"; return 1
+  fi
+  # install.sh preserves /var/lib/hiddify-toolkit, so enabled modules stay enabled.
+  bash "$tmp/install.sh" --no-menu
+  rm -rf "$tmp"
+  ok "updated to v$(version)"
+}
+
+do_uninstall() {
+  need_root
+  say "=== uninstall: reverting every enabled module first ==="
+  local f id
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    IFS='|' read -r id _ _ _ _ < <(ht_module_meta "$f")
+    ht_is_enabled "$id" || continue
+    ht_module_run "$f" mod_revert >/dev/null 2>&1 && ok "reverted $id" || warn "revert of $id reported a problem"
+  done < <(ht_module_files)
+  ht_guard_remove
+  rm -f /usr/local/bin/hiddify-toolkit
+  rm -rf "$HT_STATE"
+  local root="$HT_ROOT"
+  ok "toolkit removed (deleting $root)"
+  rm -rf "$root"
+}
+
+# -------------------------------------------------------------------- menu ---
+module_menu() {
+  local file="$1" id title title_fa desc st
+  IFS='|' read -r id title title_fa _ desc < <(ht_module_meta "$file")
+  while true; do
+    st="$(ht_module_state "$file")"
+    printf '\n'
+    say "  $title"
+    [ -n "$title_fa" ] && dim "  $title_fa"
+    printf '\n'
+    printf '  %s\n\n' "$desc"
+    printf '  current: %b\n\n' "$(_state_label "$st")"
+    ht_module_run "$file" mod_status | sed 's/^/    /'
+    printf '\n'
+    printf '   1) apply / اعمال\n'
+    printf '   2) revert to previous state / برگشت به حالت قبل\n'
+    printf '   0) back / بازگشت\n\n'
+    read -rp "  > " a
+    case "$a" in
+      1) do_apply  "$file"; read -rp "  press enter..." _ ;;
+      2) do_revert "$file"; read -rp "  press enter..." _ ;;
+      0|q|"") return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+main_menu() {
+  local -a files=()
+  local f
+  while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(ht_module_files)
+  if [ "${#files[@]}" -eq 0 ]; then err "no modules found in $HT_ROOT/modules"; exit 1; fi
+
+  while true; do
+    do_status
+    printf '   s) full status    u) update toolkit    x) uninstall    q) quit\n\n'
+    read -rp "  select module # > " a
+    case "$a" in
+      ''|q|Q) printf '\n'; exit 0 ;;
+      s|S) do_status_verbose; read -rp "  press enter..." _ ;;
+      u|U) do_update; read -rp "  press enter..." _ ;;
+      x|X) read -rp "  really remove everything? type YES: " c
+           [ "$c" = "YES" ] && { do_uninstall; exit 0; } ;;
+      *)
+        if [ "$a" -ge 1 ] 2>/dev/null && [ "$a" -le "${#files[@]}" ]; then
+          module_menu "${files[$((a - 1))]}"
+        fi ;;
+    esac
+  done
+}
+
+# -------------------------------------------------------------------- entry --
+cmd="${1:-menu}"
+case "$cmd" in
+  menu)      need_root; ht_init_state; ht_adopt_applied; main_menu ;;
+  status)    ht_init_state; do_status; do_status_verbose ;;
+  reassert)  need_root; ht_init_state; do_reassert ;;
+  adopt)     need_root; ht_init_state; ht_adopt_applied; ht_guard_sync ;;
+  apply|revert)
+    need_root; ht_init_state
+    [ $# -ge 2 ] || { err "usage: hiddify-toolkit $cmd <module-id>"; exit 2; }
+    f="$(ht_module_file_by_id "$2")" || { err "no such module: $2"; exit 2; }
+    if [ "$cmd" = "apply" ]; then do_apply "$f"; else do_revert "$f"; fi ;;
+  update)    do_update ;;
+  uninstall) do_uninstall ;;
+  version|-v|--version) version ;;
+  help|-h|--help) sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) err "unknown command: $cmd"; exit 2 ;;
+esac
