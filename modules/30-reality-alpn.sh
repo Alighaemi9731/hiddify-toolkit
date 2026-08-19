@@ -32,7 +32,6 @@
 # shellcheck disable=SC2034
 MOD_ID="reality-alpn"
 MOD_TITLE="Reality domain ALPN fix"
-MOD_TITLE_FA="اصلاح ALPN دامنه‌های Reality"
 MOD_DESC="Lets the panel accept Reality SNI domains that only speak http/1.1, by offering http/1.1 alongside h2 in the panel's ALPN list (a Hiddify update wipes this; the guard re-applies it)."
 MOD_GUARD=yes
 

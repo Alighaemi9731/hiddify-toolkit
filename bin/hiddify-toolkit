@@ -52,7 +52,7 @@ _state_label() {
 # ------------------------------------------------------------------ actions --
 do_apply() {
   local file="$1" id title
-  IFS='|' read -r id title _ _ _ < <(ht_module_meta "$file")
+  IFS='|' read -r id title _ _ < <(ht_module_meta "$file")
   say "=== apply: $title ==="
   if ! ht_module_run "$file" mod_apply; then
     err "apply failed — nothing was enabled"; ht_log "apply FAILED $id"; return 1
@@ -73,7 +73,7 @@ do_apply() {
 
 do_revert() {
   local file="$1" id title
-  IFS='|' read -r id title _ _ _ < <(ht_module_meta "$file")
+  IFS='|' read -r id title _ _ < <(ht_module_meta "$file")
   say "=== revert: $title ==="
   if ht_module_run "$file" mod_revert; then
     ht_mark_disabled "$id"; ht_guard_sync
@@ -90,7 +90,7 @@ do_status() {
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     n=$((n + 1))
-    IFS='|' read -r id title _ _ _ < <(ht_module_meta "$f")
+    IFS='|' read -r id title _ _ < <(ht_module_meta "$f")
     st="$(ht_module_state "$f")"
     printf '   %-3s %b   %s\n' "$n" "$(_state_label "$st")" "$title"
   done < <(ht_module_files)
@@ -104,7 +104,7 @@ do_status_verbose() {
   local f title
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    IFS='|' read -r _ title _ _ _ < <(ht_module_meta "$f")
+    IFS='|' read -r _ title _ _ < <(ht_module_meta "$f")
     say "--- $title"
     ht_module_run "$f" mod_status | sed 's/^/    /'
     printf '\n'
@@ -115,7 +115,7 @@ do_reassert() {
   local f id guard rc=0
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    IFS='|' read -r id _ _ guard _ < <(ht_module_meta "$f")
+    IFS='|' read -r id _ guard _ < <(ht_module_meta "$f")
     [ "$guard" = "yes" ] || continue
     ht_is_enabled "$id" || continue
     ht_module_run "$f" mod_reassert >/dev/null 2>&1 || { rc=1; ht_log "reassert FAILED $id"; }
@@ -142,7 +142,7 @@ do_uninstall() {
   local f id
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    IFS='|' read -r id _ _ _ _ < <(ht_module_meta "$f")
+    IFS='|' read -r id _ _ _ < <(ht_module_meta "$f")
     ht_is_enabled "$id" || continue
     ht_module_run "$f" mod_revert >/dev/null 2>&1 && ok "reverted $id" || warn "revert of $id reported a problem"
   done < <(ht_module_files)
@@ -156,21 +156,20 @@ do_uninstall() {
 
 # -------------------------------------------------------------------- menu ---
 module_menu() {
-  local file="$1" id title title_fa desc st
-  IFS='|' read -r id title title_fa _ desc < <(ht_module_meta "$file")
+  local file="$1" id title desc st
+  IFS='|' read -r id title _ desc < <(ht_module_meta "$file")
   while true; do
     st="$(ht_module_state "$file")"
     printf '\n'
     say "  $title"
-    [ -n "$title_fa" ] && dim "  $title_fa"
     printf '\n'
     printf '  %s\n\n' "$desc"
     printf '  current: %b\n\n' "$(_state_label "$st")"
     ht_module_run "$file" mod_status | sed 's/^/    /'
     printf '\n'
-    printf '   1) apply / اعمال\n'
-    printf '   2) revert to previous state / برگشت به حالت قبل\n'
-    printf '   0) back / بازگشت\n\n'
+    printf '   1) apply\n'
+    printf '   2) revert to previous state\n'
+    printf '   0) back\n\n'
     read -rp "  > " a
     case "$a" in
       1) do_apply  "$file"; read -rp "  press enter..." _ ;;

@@ -44,7 +44,6 @@ MOD_ID="ipv6"
 # shellcheck disable=SC2034
 MOD_TITLE="Disable IPv6 (permanently)"
 # shellcheck disable=SC2034
-MOD_TITLE_FA="غیرفعال‌سازی دائمی IPv6"
 # shellcheck disable=SC2034
 MOD_DESC="Turns IPv6 off on every interface and holds it off against Hiddify's apply-config, which re-enables it on every run."
 # shellcheck disable=SC2034

@@ -85,12 +85,11 @@ already-modified copy — that is exactly how a revert silently starts restoring
 ## Adding a module
 
 Drop a file in `modules/`, named `<NN>-<id>.sh`. `NN` orders it in the menu. It is a sourced
-library — no shebang logic, no `main()`:
+library — no shebang logic, no `main()`. Everything user-facing is English:
 
 ```bash
 MOD_ID="example"
 MOD_TITLE="Human readable title"
-MOD_TITLE_FA="عنوان فارسی"
 MOD_DESC="One sentence describing what this changes."
 MOD_GUARD=yes                 # yes => mod_reassert runs every 2 min while enabled
 

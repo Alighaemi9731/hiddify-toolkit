@@ -31,7 +31,6 @@
 {
 MOD_ID="outbound-ip"
 MOD_TITLE="Choose the outbound IP"
-MOD_TITLE_FA="انتخاب آی‌پی خروجی سرور"
 MOD_DESC="Sends all outbound (server-initiated) traffic through an IPv4 address you pick, while inbound keeps landing on the current one — no DNS and no client-config change."
 MOD_GUARD=yes
 }

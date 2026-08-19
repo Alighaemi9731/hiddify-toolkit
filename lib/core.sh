@@ -137,12 +137,12 @@ ht_module_files() {
 # only one may ever be sourced into a given shell. Both helpers below therefore
 # run in a subshell — that isolation is what lets the menu list ten modules and
 # then act on one without their functions colliding.
-ht_module_meta() {                       # <file>  ->  id|title|title_fa|guard|desc
+ht_module_meta() {                       # <file>  ->  id|title|guard|desc
   (
     # shellcheck disable=SC1090
     . "$1" 2>/dev/null || exit 1
-    printf '%s|%s|%s|%s|%s\n' "${MOD_ID:-}" "${MOD_TITLE:-}" "${MOD_TITLE_FA:-}" \
-                              "${MOD_GUARD:-no}" "${MOD_DESC:-}"
+    printf '%s|%s|%s|%s\n' "${MOD_ID:-}" "${MOD_TITLE:-}" \
+                           "${MOD_GUARD:-no}" "${MOD_DESC:-}"
   )
 }
 
@@ -239,7 +239,7 @@ ht_adopt_applied() {
   local f id guard
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    IFS='|' read -r id _ _ guard _ < <(ht_module_meta "$f")
+    IFS='|' read -r id _ guard _ < <(ht_module_meta "$f")
     [ "$guard" = "yes" ] || continue
     ht_is_enabled "$id" && continue
     if [ "$(ht_module_state "$f")" = "APPLIED" ]; then
@@ -256,7 +256,7 @@ ht_guard_sync() {
   ht_adopt_applied
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    IFS='|' read -r id _ _ guard _ < <(ht_module_meta "$f")
+    IFS='|' read -r id _ guard _ < <(ht_module_meta "$f")
     [ "$guard" = "yes" ] && ht_is_enabled "$id" && need=1
   done < <(ht_module_files)
   if [ "$need" = "1" ]; then ht_guard_install; else ht_guard_remove; fi

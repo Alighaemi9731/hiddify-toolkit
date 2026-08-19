@@ -30,7 +30,6 @@
 # shellcheck disable=SC2034  # MOD_* are consumed by the core after sourcing
 MOD_ID="tuning"
 MOD_TITLE="Kernel & network tuning"
-MOD_TITLE_FA="بهینه‌سازی هسته و شبکه"
 MOD_DESC="Re-computes tcp_mem / TIME_WAIT / conntrack / file-max / backlogs / ephemeral ports from this box's real RAM and CPU, preloads nf_conntrack so the netfilter values actually apply, spreads NIC softirq over every core (RPS/RFS), adds the logrotate Hiddify ships without, and neutralises the hiddify-cli crash loop."
 MOD_GUARD=yes
 
