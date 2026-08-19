@@ -136,7 +136,7 @@ _tun_derive() {
 # no-match grep fails the whole assignment, and the standalone script aborted
 # right there.
 _tun_scrape_reserved() {
-  local from_cfg="" from_live="" seen=""
+  local from_cfg="" from_tcp="" from_udp="" seen=""
   TUN_RESERVED=""
 
   if [ -f /opt/hiddify-manager/haproxy/haproxy.cfg ]; then
@@ -147,17 +147,39 @@ _tun_scrape_reserved() {
       | grep -oE '[0-9]{4,5}$')" || from_cfg=""
   fi
 
-  # Everything ELSE bound inside the band we just widened. -u matters as much as
-  # -t here. If ss is missing the pipeline yields nothing and we fall back to the
-  # cfg-only set — same behaviour as before, never worse.
-  from_live="$(ss -Hlntu 2>/dev/null | awk '{print $5}' | sed 's/.*://' \
-    | grep -oE '^[0-9]+$')" || from_live=""
+  # TCP: LISTEN only. A LISTEN socket IS a server socket by definition, so this
+  # catches sshd-on-a-high-port and every panel listener and can never catch a
+  # transient one. Test $1=="tcp" rather than dropping -u, because without -u the
+  # Netid column disappears and the local address moves from $5 to $4.
+  from_tcp="$(ss -Hlntu 2>/dev/null | awk '$1=="tcp"{print $5}' | sed 's/.*://' \
+    | grep -oE '^[0-9]+$')" || from_tcp=""
+
+  # UDP has NO listen state: `ss -lu` reports every UNCONNECTED socket, and on a box
+  # relaying UDP that includes the per-session socket sing-box/hysteria opens at an
+  # ephemeral port (ListenPacket), plus chrony's client port and warp's source port.
+  # Unioning those into a set we then REMEMBER FOREVER grew the reserved list without
+  # bound and rewrote this module's generated sysctl file on EVERY 2-minute tick —
+  # measured at ~3 new ports/tick, 628 reserved on a live box inside a day. So read
+  # the UDP side from CONFIGURATION, which is stable by construction.
+  from_udp="$( { wg show all listen-port 2>/dev/null | awk '{print $NF}'
+      grep -rhoE 'ListenPort[[:space:]]*=[[:space:]]*[0-9]+' /etc/wireguard 2>/dev/null
+      grep -rhoE '"listen_port"[[:space:]]*:[[:space:]]*[0-9]+' \
+        /opt/hiddify-manager/singbox /opt/hiddify-manager/xray 2>/dev/null
+      # Load-bearing `:` — under `set -o pipefail` the GROUP's status is the last
+      # grep's, and a no-match there would fail the whole substitution and send the
+      # `|| from_udp=""` below straight over ports we did find.
+      :
+    } | grep -oE '[0-9]+$')" || from_udp=""
 
   seen="$(ht_conf_get reserved_seen '' | tr ',' '\n')" || seen=""
 
-  TUN_RESERVED="$(printf '%s\n%s\n%s\n' "$from_cfg" "$from_live" "$seen" \
+  # head -256 is a backstop, not sizing: a reserved list that grows without bound
+  # rewrites the generated file on every tick and eventually overruns the fixed line
+  # buffer procps `sysctl -p` reads each line into — and it fails asymmetrically,
+  # because systemd's boot-time parser has no such limit.
+  TUN_RESERVED="$(printf '%s\n%s\n%s\n%s\n' "$from_cfg" "$from_tcp" "$from_udp" "$seen" \
     | grep -E '^[0-9]+$' | sort -un \
-    | awk '$1>=32768 && $1<=65535' | paste -sd, -)" || TUN_RESERVED=""
+    | awk '$1>=32768 && $1<=65535' | head -256 | paste -sd, -)" || TUN_RESERVED=""
   return 0
 }
 
