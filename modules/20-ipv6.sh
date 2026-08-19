@@ -161,7 +161,12 @@ _ipv6_conflict_files() {
     else
       printf '%s\n' "$f"
     fi
-  done < <(grep -rlE '^[[:space:]]*net\.ipv6\.conf\.(all|default)\.disable_ipv6[[:space:]]*=[[:space:]]*0' \
+  # -R, not -r: `sysctl --system` reads every *.conf in the directory INCLUDING
+  # symlinks, and Hiddify's own /etc/sysctl.d/hiddify.conf is a symlink into
+  # /opt/hiddify-manager. GNU grep -r follows a symlink only when it is named on the
+  # command line, so -r reports the single most likely conflict on this platform as
+  # absent.
+  done < <(grep -RlE '^[[:space:]]*net\.ipv6\.conf\.(all|default)\.disable_ipv6[[:space:]]*=[[:space:]]*0' \
              /etc/sysctl.d /etc/sysctl.conf 2>/dev/null | sort -u)
   return 0
 }
@@ -210,10 +215,15 @@ SYSCTL_EOF
 # ::ffff:a.b.c.d is excluded deliberately: that is an AF_INET6 socket bound to an IPv4
 # address, it needs no IPv6 address on any device and survives the change untouched.
 _ipv6_literal_binds() {
+  # In `ss -6` output the ONLY column ending in :<digits> is the local address (the
+  # peer column is always :*), so match that and nothing else. Do NOT require a
+  # closing "]" immediately before the port: iproute2 renders a scoped address as
+  # [fe80::5054:ff:fe12:3456]%eth0:546 — the %iface sits OUTSIDE the bracket, and a
+  # /^\[.*\]:[0-9]+$/ pattern silently drops every link-local listener there is.
   { ss -ltn -6 2>/dev/null; ss -lun -6 2>/dev/null; } \
-    | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\[.*\]:[0-9]+$/) { print $i; break } }' \
-    | grep -vE '^\[::\]:' \
-    | grep -vE '^\[::ffff:' \
+    | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) { print $i; break } }' \
+    | grep -vE '^(\[::\]|\*)(%[^:]*)?:[0-9]+$' \
+    | grep -vE '^\[?::ffff:' \
     | sort -u || true
 }
 
