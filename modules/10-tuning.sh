@@ -329,6 +329,13 @@ _tun_rps_script_body() {
 # picked up without re-running the toolkit.
 set -u
 NIC="$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')"
+# Same fallback as _tun_derive in the module. Without it, a box with no IPv4
+# default route resolves a NIC module-side, expects a mask on it, and gets none
+# here — mod_verify then fails and the core auto-reverts the entire healthy
+# sysctl layer over a cosmetic RPS mismatch. The two must agree or they fight.
+if [ -z "${NIC:-}" ]; then
+  NIC="$(ip -o link show 2>/dev/null | awk -F': ' '$2!="lo"{print $2; exit}')"
+fi
 [ -n "${NIC:-}" ] || exit 0
 NCPU="$(nproc 2>/dev/null)" || NCPU=1
 [ -n "$NCPU" ] || NCPU=1
@@ -661,7 +668,15 @@ _tun_capture_baseline() {             # [adopt]
     # no-op that prints success — strictly worse than having no baseline, which
     # at least says so out loud in mod_status.
     [ "$mode" = "adopt" ] && return 1
-    warn "already tuned but no pristine baseline found — capturing current values"
+    # Same argument as the paragraph above, and it does not stop at adopt mode:
+    # reaching here at all means the box is ALREADY tuned (our file is on disk)
+    # while we hold no baseline, so the live kernel IS the tuned kernel. Snapshot
+    # it and revert silently becomes a no-op that reports success, while
+    # mod_status starts printing a confident "baseline: <path> (source=live)" over
+    # it. Record nothing — mod_status then keeps saying NONE, which is the truth.
+    warn "already tuned by hand and no pristine baseline survives — recording none"
+    warn "  revert can remove our files but cannot restore the previous values"
+    return 1
   fi
 
   # The `key = value` / `# rps_cpus = ` layout IS the parsing contract of
