@@ -68,6 +68,16 @@ MOD_TITLE="Log disk-space guard"
 MOD_DESC="Holds /opt/hiddify-manager/log under a hard ceiling — every file capped, the whole tree on a budget, re-checked every 2 minutes instead of once a day — and caps systemd-journald, which ships uncapped at 10% of the disk. This is the failure that fills a panel's disk and stops the panel opening."
 MOD_GUARD=yes
 
+# The tuning module also truncates /opt/hiddify-manager/log/system/*.log at a
+# HARDCODED 100 MB on the same guard tick, and it runs first (10- before 50-).
+# That is a deliberate safety net for boxes where only tuning is on, and it is
+# invisible in the log because tuning discards its reclaim output — so a live
+# *.log can vanish from under this module with nothing here reporting it.
+# Harmless while file_mb <= 100. Above that, tuning's fixed 100 MB is the real
+# limit for that one directory, and mod_status says so rather than letting the
+# configured number quietly not be the truth.
+LC_TUNING_FIXED_MB=100
+
 LC_LOGROOT=/opt/hiddify-manager/log
 LC_JOURNALD_DIR=/etc/systemd/journald.conf.d
 LC_JOURNALD_FILE=/etc/systemd/journald.conf.d/zz-hiddify-toolkit.conf
@@ -495,6 +505,13 @@ mod_status() {
              "orphaned" "$(_lc_mb "$orph_b")"
       printf '%s\n' "$orph" | awk -F'\t' '$1>1048576{printf "%-15s: %s MB  %s\n","",int($1/1048576),$3}'
     fi
+  fi
+
+  if [ "$file_mb" -gt "$LC_TUNING_FIXED_MB" ] && ht_is_enabled tuning; then
+    printf '%-15s: the tuning module truncates %s/system/*.log at a fixed %s MB and runs\n' \
+           "note" "$LC_LOGROOT" "$LC_TUNING_FIXED_MB"
+    printf '%-15s  first, so %s MB is the real ceiling in that one directory\n' \
+           "" "$LC_TUNING_FIXED_MB"
   fi
 
   if [ "$jmb" = "0" ]; then
