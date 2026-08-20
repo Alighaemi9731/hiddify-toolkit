@@ -76,6 +76,16 @@ while its real cost is a few hundred KB. (Measured on one box: 2,150,617 bytes "
 3,440 512-byte blocks — 1.7 MB of actual disk.) Cap on the apparent size and the module
 would re-truncate the same file every two minutes forever, reclaiming nothing.
 
+**And the one nothing on the filesystem can see.** Deleting a live log with `rm` — the
+obvious manual cure — frees nothing: the writer keeps its fd, so the inode lives on with no
+name, invisible to `ls`, `du`, `find`, logrotate and the sweep above, and still growing.
+Measured on a panel while this module was being written: **8,282 MB of allocated disk
+(146 GB apparent) behind one `hiddify-panel` fd, on a box whose visible log tree was 16 KB.**
+`df` climbed with nothing to point at. So the sweep also walks `/proc/<pid>/fd` for links
+ending in `" (deleted)"` that point into the log tree and truncates those through `/proc`,
+which reclaims the space with **no restart and no outage** (proven live: 14 GB used → 4.5 GB,
+`hiddify-panel` never left `active`). Read-only fds are reported and never touched.
+
 Live `*.log` files are **truncated, never deleted** — the writer holds the fd, so unlinking
 frees zero bytes until the service restarts. Rotated copies have no fd and are deleted,
 oldest first. `*.lock` (above all `0-install.lock`), `*.pid` and `*.sock` are never touched,

@@ -44,6 +44,19 @@
 #   restarts, so `rm` on a live log looks like it worked and changes nothing.
 #   Rotated copies have no fd behind them and ARE deleted.
 #
+# AND THE ONE `find` CAN NEVER SEE
+#   Deleting a live log with `rm` — the obvious manual cure, and the one that gets
+#   used — does not free a byte. The writer keeps its fd, so the inode lives on
+#   with no name: invisible to ls, to du, to find, to logrotate and to the sweep
+#   above, and still growing. Measured on s4 while writing this module: 8,282 MB
+#   of allocated disk (146 GB apparent) behind hiddify-panel's fd 2, on a box
+#   whose whole visible log tree was 16 KB.
+#
+#   So the sweep also walks /proc/<pid>/fd for links that end in " (deleted)" and
+#   point into the log tree, and truncates those through /proc. That reclaims the
+#   space with no restart and no outage — proven live on s4: 14 GB used -> 4.5 GB,
+#   hiddify-panel never left active.
+#
 # journald is capped here too, because it is the same disease and it was the
 # larger consumer on all seven panels: with no SystemMaxUse, journald takes 10%
 # of the filesystem (measured 1.0-2.4 GB per box, uncapped on every one).
@@ -149,6 +162,99 @@ _lc_total_bytes() {
   printf '%s\n' "$total"
 }
 
+# ---------------------------------------------------- deleted-but-open files --
+# `rm` on a live log frees nothing — the writer holds the fd and the inode lives
+# on unnamed. Nothing that walks the FILESYSTEM can see it, which is what makes
+# this the most dangerous shape of the bug: the directory looks clean, du agrees,
+# and df keeps climbing with nothing to point at.
+#
+# One find over the fd directories rather than a readlink per fd: a panel has a
+# few hundred processes with tens of fds each, and a fork per fd every two
+# minutes is not a guard, it is a load generator.
+_lc_deleted_fds() {
+  local d
+  local -a dirs=()
+  for d in /proc/[0-9]*/fd; do [ -d "$d" ] && dirs+=("$d"); done
+  [ "${#dirs[@]}" -gt 0 ] || return 0
+  find "${dirs[@]}" -maxdepth 1 -type l -lname "${LC_LOGROOT}/* (deleted)" -print0 2>/dev/null
+}
+
+# Only fds opened for WRITING. A deleted file somebody is still READING is not
+# ours to empty, and the whole point of acting through /proc is that we are
+# reaching past every normal safety check the filesystem would give us.
+_lc_fd_writable() {                      # </proc/PID/fd/N>
+  local pid num fl
+  pid="${1#/proc/}"; pid="${pid%%/*}"
+  num="${1##*/}"
+  fl="$(awk '/^flags:/{print $2; exit}' "/proc/$pid/fdinfo/$num" 2>/dev/null)" || return 1
+  [ -n "$fl" ] || return 1
+  case $(( 8#$fl & 3 )) in (1|2) return 0 ;; esac
+  return 1
+}
+
+# Prints "<bytes>\t<fdpath>\t<origpath>" per DISTINCT inode. Distinct matters:
+# stdout and stderr are routinely two fds on one inode, and a fleet of duplicates
+# would report the same 8 GB three times and truncate it three times.
+_lc_orphans() {
+  local fd tgt key sz base
+  local -A seen=()
+  while IFS= read -r -d '' fd; do
+    tgt="$(readlink "$fd" 2>/dev/null)" || continue
+    tgt="${tgt% (deleted)}"
+    base="${tgt##*/}"
+    # Same classification as the on-disk sweep: a lock or an unrecognised name is
+    # left alone here too.
+    case "$(_lc_class "$base")" in (live|archive) ;; (*) continue ;; esac
+    key="$(stat -Lc '%d:%i' "$fd" 2>/dev/null)" || continue
+    [ -n "${seen[$key]:-}" ] && continue
+    seen[$key]=1
+    sz="$(stat -Lc %b "$fd" 2>/dev/null)" || continue
+    case "$sz" in (*[!0-9]*|'') continue ;; esac
+    printf '%s\t%s\t%s\n' "$(( sz * 512 ))" "$fd" "$tgt"
+  done < <(_lc_deleted_fds)
+}
+
+_lc_orphan_bytes() {
+  local sz fd tgt t=0
+  while IFS=$'\t' read -r sz fd tgt; do
+    [ -n "$sz" ] && t=$(( t + sz ))
+  done < <(_lc_orphans)
+  printf '%s\n' "$t"
+}
+
+_lc_orphan_over_cap() {
+  local sz fd tgt cap_b n=0
+  cap_b=$(( $(_lc_file_mb) * 1048576 ))
+  while IFS=$'\t' read -r sz fd tgt; do
+    [ -n "$sz" ] && [ "$sz" -gt "$cap_b" ] && n=$(( n + 1 ))
+  done < <(_lc_orphans)
+  printf '%s\n' "$n"
+}
+
+# Truncating through /proc/<pid>/fd/<n> empties the inode the fd points at, with
+# no restart and no outage — the alternative is restarting hiddify-panel, which
+# is not something a 2-minute timer should be doing. Proven live on s4:
+# 14 GB used -> 4.5 GB, hiddify-panel never left active.
+_lc_sweep_orphans() {
+  local sz fd tgt cap_b
+  cap_b=$(( $(_lc_file_mb) * 1048576 ))
+  while IFS=$'\t' read -r sz fd tgt; do
+    [ -n "$sz" ] || continue
+    [ "$sz" -gt "$cap_b" ] || continue
+    _lc_fd_writable "$fd" || {
+      printf 'SKIPPED %s (%s, deleted and held open READ-ONLY)\n' "$tgt" "$(_lc_human "$sz")"
+      continue
+    }
+    if : > "$fd" 2>/dev/null; then
+      printf 'truncated %s (%s, DELETED but still held open — invisible to du/find)\n' \
+             "$tgt" "$(_lc_human "$sz")"
+    else
+      printf 'FAILED to truncate the deleted inode behind %s\n' "$tgt"
+    fi
+  done < <(_lc_orphans)
+  return 0
+}
+
 # ------------------------------------------------------------------ sweep ----
 # Prints one line per action taken; prints nothing at all on a quiet tick, which
 # is what lets the caller decide whether anything is worth logging.
@@ -159,6 +265,11 @@ _lc_sweep() {
   local file_mb dir_mb cap_b budget_b
   file_mb="$(_lc_file_mb)"; dir_mb="$(_lc_dir_mb)"
   cap_b=$(( file_mb * 1048576 )); budget_b=$(( dir_mb * 1048576 ))
+
+  # Before anything on disk: the space that no directory listing can account for.
+  # Independent of the tree budget below — a deleted inode is not IN the tree, and
+  # deleting an archive would not shrink it.
+  _lc_sweep_orphans
 
   [ -d "$LC_LOGROOT" ] || return 0
 
@@ -354,7 +465,7 @@ _lc_note_clear() { rm -f "$(ht_state_dir)/${MOD_ID}.note" 2>/dev/null; return 0;
 
 # ====================================================================== API ===
 mod_status() {
-  local file_mb dir_mb jmb total over big jb jstate jline=""
+  local file_mb dir_mb jmb total over big jb jstate orph orph_b orph_over
 
   file_mb="$(_lc_file_mb)"; dir_mb="$(_lc_dir_mb)"; jmb="$(_lc_journal_mb)"
 
@@ -371,6 +482,19 @@ mod_status() {
     [ -n "$big" ] && printf '%-15s: %s MB  %s\n' "biggest" "${big%% *}" "${big#* }"
     [ "$over" != "0" ] && printf '%-15s: %s file(s) over the %s MB cap right now\n' \
                                   "over cap" "$over" "$file_mb"
+  fi
+
+  # One /proc walk, reused. mod_status is re-rendered on every menu redraw.
+  orph="$(_lc_orphans)"
+  orph_b=0; orph_over=0
+  if [ -n "$orph" ]; then
+    orph_b="$(printf '%s\n' "$orph" | awk -F'\t' '{t+=$1} END{print t+0}')"
+    orph_over="$(printf '%s\n' "$orph" | awk -F'\t' -v c=$(( file_mb * 1048576 )) '$1>c{n++} END{print n+0}')"
+    if [ "$orph_b" -gt 1048576 ]; then
+      printf '%-15s: %s MB deleted but still held open — invisible to du/ls/find\n' \
+             "orphaned" "$(_lc_mb "$orph_b")"
+      printf '%s\n' "$orph" | awk -F'\t' '$1>1048576{printf "%-15s: %s MB  %s\n","",int($1/1048576),$3}'
+    fi
   fi
 
   if [ "$jmb" = "0" ]; then
@@ -414,6 +538,10 @@ mod_status() {
     printf 'PARTIAL  %s file(s) over the cap — the guard has not swept them yet\n' "$over"
     return 0
   fi
+  if [ "$orph_over" != "0" ]; then
+    printf 'PARTIAL  %s deleted-but-open file(s) over the cap — someone rm'\''d a live log\n' "$orph_over"
+    return 0
+  fi
   if [ "$total" -gt $(( dir_mb * 1048576 )) ]; then
     printf 'PARTIAL  tree is %s MB, over the %s MB budget\n' "$(_lc_mb "$total")" "$dir_mb"
     return 0
@@ -455,16 +583,13 @@ mod_apply() {
 
   # --- 1. the log tree, right now --------------------------------------------
   say "=== 1. sweeping $LC_LOGROOT ==="
-  if [ ! -d "$LC_LOGROOT" ]; then
-    warn "$LC_LOGROOT does not exist — nothing to sweep"
+  [ -d "$LC_LOGROOT" ] || warn "$LC_LOGROOT does not exist — only deleted-but-open logs to check"
+  out="$(_lc_sweep)"
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out" | sed 's/^/    /'
+    ht_log "[$MOD_ID] apply sweep: $(printf '%s' "$out" | tr '\n' ';')"
   else
-    out="$(_lc_sweep)"
-    if [ -n "$out" ]; then
-      printf '%s\n' "$out" | sed 's/^/    /'
-      ht_log "[$MOD_ID] apply sweep: $(printf '%s' "$out" | tr '\n' ';')"
-    else
-      ok "already within limits ($(_lc_mb "$(_lc_total_bytes)") MB)"
-    fi
+    ok "already within limits ($(_lc_mb "$(_lc_total_bytes)") MB on disk, $(_lc_mb "$(_lc_orphan_bytes)") MB orphaned)"
   fi
 
   # --- 2. journald ------------------------------------------------------------
@@ -509,6 +634,9 @@ mod_verify() {
     [ "$(systemctl is-active systemd-journald 2>/dev/null)" = "active" ] \
       || { err "systemd-journald is not active after the config change"; return 1; }
   fi
+
+  over="$(_lc_orphan_over_cap)"
+  [ "$over" = "0" ] || { err "$over deleted-but-open file(s) still over the $(_lc_file_mb) MB cap"; return 1; }
 
   if [ -d "$LC_LOGROOT" ]; then
     over="$(_lc_over_cap_count)"
@@ -556,13 +684,14 @@ mod_reassert() {
   # THE HOT PATH. stat over one small directory via a single find — no service
   # action, no fork storm — which is exactly why this is affordable every 2
   # minutes and a daily logrotate is not.
-  if [ -d "$LC_LOGROOT" ]; then
-    out="$(_lc_sweep 2>/dev/null)"
-    if [ -n "$out" ]; then
-      # Not deduped: every line here is a real reclaim that just happened, and
-      # two identical lines an hour apart are two different events.
-      ht_log "[$MOD_ID] $(printf '%s' "$out" | tr '\n' ';')"
-    fi
+  # Unconditional: _lc_sweep checks for the directory itself, and the deleted-but-open
+  # case has no directory to check — on s4 the whole visible tree was 16 KB while
+  # 8.2 GB sat behind one fd.
+  out="$(_lc_sweep 2>/dev/null)"
+  if [ -n "$out" ]; then
+    # Not deduped: every line here is a real reclaim that just happened, and two
+    # identical lines an hour apart are two different events.
+    ht_log "[$MOD_ID] $(printf '%s' "$out" | tr '\n' ';')"
   fi
 
   jmb="$(_lc_journal_mb)"
