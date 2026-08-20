@@ -50,6 +50,40 @@ the 35–65 second range.
 | 2 | Disable IPv6 permanently | `ipv6` | For boxes with no working IPv6, where dual-stack services (Google/Gemini) break because clients push AAAA traffic the server cannot route. Beats Hiddify's `sysctl -w …=0`, which no config file can. |
 | 3 | Reality domain ALPN fix | `reality-alpn` | Lets the panel accept Reality SNI domains that only speak `http/1.1`. Patches panel code, so a Hiddify **update** wipes it — the guard notices and re-applies. |
 | 4 | Choose the outbound IP | `outbound-ip` | Detects every IPv4 on the box, lets you pick one, and sends all **outbound** traffic through it while **inbound stays on the existing address** — no DNS change, no client-config change. Use it when your main IP picks up a bad reputation and a service starts refusing it. |
+| 5 | Log disk-space guard | `logcap` | Hiddify ships no rotation for `/opt/hiddify-manager/log`, and one stuck client socket makes the panel write ~4 MB/s into it until the disk is full and the panel stops opening. Holds every file in that tree under a cap and the tree itself under a budget, re-checked every 2 minutes instead of once a day, and caps `systemd-journald`, which ships uncapped at 10% of the filesystem. |
+
+### Why `logcap` is not just a logrotate file
+
+The `tuning` module already drops `/etc/logrotate.d/hiddify-manager` with `size 100M`, and
+that is not enough, for two reasons that only show up on a real box:
+
+- **`size` is a condition logrotate evaluates *when it runs*,** and on Ubuntu it runs from
+  `logrotate.timer`, `OnCalendar=daily`. The panel's EPIPE spin loop writes ~4 MB/s. Between
+  two daily runs that is ~345 GB — the disk dies long before `rotate 3` gets a turn.
+- **Rotation leaves the evidence behind.** Measured on a live panel: a 321 MB
+  `hiddify_panel.err.log.1`, 14,639,476 of whose 14,639,588 lines were the single string
+  `Client <n> hit errno <n>`. It was a *rotated* copy, which logrotate's own `size` clause
+  never looks at again, and nothing else was watching it.
+
+So the ceiling is enforced on the 2-minute guard cycle, over the whole tree rather than just
+the live `*.log` files.
+
+**The one non-obvious rule inside it:** size means *allocated blocks*, never `stat -c %s`.
+`hiddify-panel.service` redirects with `StandardError=file:`, and systemd's `file:` opens
+**without** `O_APPEND` — so after a truncate the service keeps writing at its old offset and
+punches a hole. The file is now sparse: its apparent size is unchanged and still climbing,
+while its real cost is a few hundred KB. (Measured on one box: 2,150,617 bytes "size",
+3,440 512-byte blocks — 1.7 MB of actual disk.) Cap on the apparent size and the module
+would re-truncate the same file every two minutes forever, reclaiming nothing.
+
+Live `*.log` files are **truncated, never deleted** — the writer holds the fd, so unlinking
+frees zero bytes until the service restarts. Rotated copies have no fd and are deleted,
+oldest first. `*.lock` (above all `0-install.lock`), `*.pid` and `*.sock` are never touched,
+and any name the module does not recognise is counted against the budget and left alone.
+
+Limits live in `/var/lib/hiddify-toolkit/conf/logcap.conf` (`file_mb`, `dir_mb`,
+`journal_mb`; `journal_mb=0` leaves journald to somebody else). Defaults: 100 MB per file,
+4x that for the tree, 512 MB of journal.
 
 Every module has **apply** and **revert to previous state**, and every apply is verified —
 if verification fails, the change is rolled back automatically instead of being left half-live.
