@@ -51,6 +51,7 @@ the 35–65 second range.
 | 3 | Reality domain ALPN fix | `reality-alpn` | Lets the panel accept Reality SNI domains that only speak `http/1.1`. Patches panel code, so a Hiddify **update** wipes it — the guard notices and re-applies. |
 | 4 | Choose the outbound IP | `outbound-ip` | Detects every IPv4 on the box, lets you pick one, and sends all **outbound** traffic through it while **inbound stays on the existing address** — no DNS change, no client-config change. Use it when your main IP picks up a bad reputation and a service starts refusing it. |
 | 5 | Log disk-space guard | `logcap` | Hiddify ships no rotation for `/opt/hiddify-manager/log`, and one stuck client socket makes the panel write ~4 MB/s into it until the disk is full and the panel stops opening. Holds every file in that tree under a cap and the tree itself under a budget, re-checked every 2 minutes instead of once a day, and caps `systemd-journald`, which ships uncapped at 10% of the filesystem. |
+| 6 | Trailing dot in domain names | `fakedomain-dot` | The panel refuses a domain written as `fast.com.` ("Should be a valid domain"), so you cannot ship configs whose `Host` header carries the root dot. Frees exactly that one form. Patches panel code, so a Hiddify **update** wipes it — the guard re-applies it. |
 
 ### Why `logcap` is not just a logrotate file
 
@@ -94,6 +95,45 @@ and any name the module does not recognise is counted against the budget and lef
 Limits live in `/var/lib/hiddify-toolkit/conf/logcap.conf` (`file_mb`, `dir_mb`,
 `journal_mb`; `journal_mb=0` leaves journald to somebody else). Defaults: 100 MB per file,
 4x that for the tree, 512 MB of journal.
+
+### What `fakedomain-dot` actually buys you, and what it does not
+
+The block is one wtforms `Regexp` in `hiddifypanel/panel/admin/DomainAdmin.py` whose first
+alternative has to end at the TLD. The module appends `\.?` to that alternative and nothing
+else — a single optional trailing dot. `fast.com.` is accepted, `fast.com..` is still refused,
+and plain domains, wildcards, IPv4 and the empty value behave exactly as before. `mod_verify`
+pulls the live pattern back out of the file and asserts all six of those cases, so a patch that
+lands but changes the meaning is rolled back rather than shipped.
+
+Nothing downstream objects, which is why one regex is the whole fix. `on_model_change` only
+`.strip()`s whitespace; `_validate_domain_ips` returns early for Fake mode, so there is no DNS
+lookup to fail; `sni = host = domain` verbatim in `hutils/proxy/shared.py`; `need_valid_ssl` is
+false for Fake mode, so the config carries `allow_insecure`; and `replace_variables.sh` derives
+`fast.com.` right back out of `fast.com..crt`, so apply-config does not churn the certificate.
+
+**The part worth knowing before you rely on it.** The dot survives in the HTTP **Host** header
+and is stripped from the **TLS SNI**. That is not Hiddify — it is `hostnameInSNI()` in Go's
+`crypto/tls`, which RFC 6066 requires, and uTLS carries the identical function. Xray-core and
+sing-box are both Go, so every client built on them sends `Host: fast.com.` and `server_name:
+fast.com`. Measured against a local TLS server:
+
+```
+client sent   sni = "fast.com."   host = "fast.com."
+ClientHello   ServerName  = "fast.com"     <- dot stripped
+server saw    Host header = "fast.com."    <- dot intact
+```
+
+So this is a **Host-header** lever: useful on `ws`, `httpupgrade`, `xhttp` and `h2`, and of no
+effect on plain TCP+TLS or Reality, which carry no Host header at all. Getting a dot into the
+SNI on the wire would take a patched client core, not a patched panel.
+
+**apply-config does not undo this one; an update does.** `apply_configs.sh` runs
+`hiddify-panel/install.sh`, which only pip-installs when `HIDDIFY_PANLE_SOURCE_DIR` is set (it
+is not) — it just bounces the unit, and the patch rides through untouched. `update_panel()`
+runs `uv pip install -U --force-reinstall hiddifypanel`, which replaces the package outright.
+The guard therefore treats "the panel is not active" as *someone else is mid-apply*, never as
+evidence against its own patch, and it restarts the panel only when the panel was up before it
+touched anything.
 
 Every module has **apply** and **revert to previous state**, and every apply is verified —
 if verification fails, the change is rolled back automatically instead of being left half-live.
