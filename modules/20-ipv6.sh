@@ -30,13 +30,23 @@
 # are untouched. A LITERAL bind does not: bind([::1]) returns EADDRNOTAVAIL on the
 # service's next restart, and Hiddify restarts its services on every apply-config,
 # which is the exact event this module is built around. Our own tuning notes record
-# shadowsocks-libev dying on `bind ::1` for precisely this reason. So the module
-# detects literal v6 binds and refuses rather than discovering it in production
-# (_ipv6_literal_binds below). The alternative fix — stop writing `all` at all,
-# write `default` plus each non-lo device by name, and relax mod_verify to `default`
-# — would keep lo alive and is still on the table; it was not taken because naming
-# devices in a sysctl file loses every interface born later (docker0, wg0, tun*),
-# which is the failure the /proc sweep exists to cover.
+# shadowsocks-libev dying on `bind ::1` for precisely this reason.
+#
+# The module used to REFUSE over that. It no longer does. Turning IPv6 off is the whole
+# point of this module, and an operator who picks it on a box with one loopback-bound
+# service wants IPv6 off — not a refusal that hands them a box in the broken state they
+# were trying to leave. So _ipv6_literal_binds() still runs on every apply; it just
+# NAMES the casualty (on screen, in the log, and in the module conf for revert to
+# repeat) and carries on. The one thing that still refuses is losing SSH
+# (_ipv6_ssh_guard) — the only failure you cannot repair from the far side of it.
+# The old `allow_v6_literal_binds=yes` escape hatch is gone with the refusal: nothing
+# reads that key now, and a box that still carries the line is unaffected either way.
+#
+# The alternative fix — stop writing `all` at all, write `default` plus each non-lo
+# device by name, and relax mod_verify to `default` — would keep lo alive and is still
+# on the table; it was not taken because naming devices in a sysctl file loses every
+# interface born later (docker0, wg0, tun*), which is the failure the /proc sweep
+# exists to cover.
 # =============================================================================
 
 # shellcheck disable=SC2034  # consumed by the core via ht_module_meta
@@ -201,9 +211,11 @@ SYSCTL_EOF
 # Listening sockets bound to a LITERAL IPv6 address (not the [::] wildcard).
 # disable_ipv6 deletes those addresses — ::1 on lo included — so these binds fail with
 # EADDRNOTAVAIL the next time their service restarts, and Hiddify restarts its services
-# on every apply-config. Nothing else in this module would notice: mod_verify checks
-# sysctls and SSH, so a service killed this way still verifies green, and mod_revert
-# re-enables IPv6 without restarting anything, so it stays dead through a revert too.
+# on every apply-config. Apply does not stop for this — it prints the list so the
+# casualty is on the record BEFORE it happens, because nothing downstream will ever
+# mention it: mod_verify checks sysctls and SSH, so a service killed this way still
+# verifies green, and mod_revert re-enables IPv6 without restarting anything, so it
+# stays dead through a revert too.
 #
 # Do NOT index ss output by column number here. ss prints a leading Netid column only
 # when the output mixes protocols, so `ss -ltnu` shifts State to $2 and the address to
@@ -452,25 +464,23 @@ mod_apply() {
     return 1
   fi
 
-  # THIRD GATE, the same reasoning one layer out: SSH is not the only thing bound to an
-  # address we are about to delete, and this is the only place that can catch it.
-  # mod_verify reads sysctls and SSH only, so a service killed here verifies GREEN and is
-  # never rolled back; mod_revert re-enables IPv6 but restarts nothing, so it stays dead
-  # through a revert too. Every refusal above this point runs before any state is written,
-  # so a refused apply leaves the conf file untouched.
+  # NOT a gate — a NOTICE. Only SSH is worth refusing over, because a lockout is the one
+  # mistake you cannot repair from the far side of it. Everything else bound to an address
+  # we are about to delete is a casualty the operator accepted the moment they chose a
+  # module called "Disable IPv6 (permanently)", so name it and keep going. This is the
+  # ONLY place it is ever named: mod_verify reads sysctls and SSH, so a service killed
+  # here verifies GREEN and is never rolled back; mod_revert re-enables IPv6 but restarts
+  # nothing, so it stays dead through a revert too.
   lit="$(_ipv6_literal_binds)"
   if [ -n "$lit" ]; then
     warn "these listeners are bound to a LITERAL IPv6 address, not the [::] wildcard:"
     printf '%s\n' "$lit" | sed 's/^/        /'
-    warn "disable_ipv6 flushes those addresses (::1 on lo included), so each one fails with"
-    warn "EADDRNOTAVAIL on its next restart — and Hiddify restarts its services on every"
-    warn "apply-config. Our own tuning notes record shadowsocks-libev dying on 'bind ::1'."
-    if [ "$(ht_conf_get allow_v6_literal_binds no)" != "yes" ]; then
-      err "refusing — restart-safe those services first, or accept the risk with:"
-      err "  echo allow_v6_literal_binds=yes >> $(ht_state_dir)/conf/ipv6.conf"
-      return 1
-    fi
-    ht_log "ipv6: applied over literal v6 binds: $(printf '%s' "$lit" | tr '\n' ' ')"
+    warn "disabling IPv6 anyway, on purpose — those addresses (::1 on lo included) go away,"
+    warn "so each listener above fails with EADDRNOTAVAIL on its NEXT restart, and Hiddify"
+    warn "restarts its services on every apply-config. Our own tuning notes record"
+    warn "shadowsocks-libev dying on 'bind ::1' for exactly this reason."
+    warn "if you still need one of them, point it at 127.0.0.1 instead and restart it."
+    ht_log "ipv6: applied over literal v6 binds (not refused): $(printf '%s' "$lit" | tr '\n' ' ')"
     ht_conf_set literal_binds "$(printf '%s' "$lit" | tr '\n' ' ')"
   else
     ht_conf_set literal_binds ""
@@ -572,10 +582,10 @@ mod_verify() {
     rc=1
   fi
 
-  # Reported, never fatal. Reaching verify at all means the operator already set
-  # allow_v6_literal_binds=yes and accepted this; failing here would roll back the very
-  # thing they just overrode. It stays visible because these services do not die now —
-  # they die at their next restart, which is the next Hiddify apply-config.
+  # Reported, never fatal. Apply deliberately does not refuse over these, so failing here
+  # would roll back a change that did exactly what it was asked to do. It stays visible
+  # because these services do not die now — they die at their next restart, which is the
+  # next Hiddify apply-config.
   lit="$(_ipv6_literal_binds)"
   if [ -n "$lit" ]; then
     warn "still bound to literal IPv6 addresses (will fail to re-bind on restart): $(printf '%s' "$lit" | tr '\n' ' ')"
