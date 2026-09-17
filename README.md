@@ -53,6 +53,45 @@ the 35–65 second range.
 | 5 | Log disk-space guard | `logcap` | Hiddify ships no rotation for `/opt/hiddify-manager/log`, and one stuck client socket makes the panel write ~4 MB/s into it until the disk is full and the panel stops opening. Holds every file in that tree under a cap and the tree itself under a budget, re-checked every 2 minutes instead of once a day, and caps `systemd-journald`, which ships uncapped at 10% of the filesystem. |
 | 6 | Trailing dot in domain names | `fakedomain-dot` | The panel refuses a domain written as `fast.com.` ("Should be a valid domain"), so you cannot ship configs whose `Host` header carries the root dot. Frees exactly that one form. Patches panel code, so a Hiddify **update** wipes it — the guard re-applies it. |
 | 7 | Keep an old port working | `port-alias` | Moving the panel from one port to another (say 8080 → 2095) cuts every client still on the old port at the next apply-config, because HAProxy only binds the ports the panel lists — and keeping both listed hands every user each config twice. Redirects the old port to the new one in the kernel (`nat/PREROUTING`, scoped to local destinations so forwarded wireguard/warp traffic is untouched), only while the new port is actually listening. Subscriptions list only the new port; old configs keep connecting. Non-interactive: `PORT_ALIASES=8080:2095 hiddify-toolkit apply port-alias`. |
+| 8 | Panel dashboard speed | `panel-speed` | The panel is served by **bjoern — one process, one thread, one request at a time**, and `system_stats()` costs ~1.4–2.2 s on a busy box (`psutil.cpu_percent(interval=1)` sleeps a full second *inside* the request; `psutil.net_connections()` walks every socket of every process). The admin dashboard polls it every 4 s with a plain `setInterval`, and `/admin/` itself calls it on every page load — so **one open dashboard tab eats ~40–55% of the whole panel and about three tabs wedge it**: the accept queue on `127.0.0.1:9000` grows past its 1024 backlog, the kernel starts dropping SYNs, and the panel stops loading in a browser with no error at all, just a spinner. Rebinds the slow calls (measured 1.9 s → 0.004 s) and slows the poll to 20 s. Patches panel code, so a Hiddify **update** wipes it — the guard re-applies it. Non-interactive: `PANEL_REFRESH_S=20 hiddify-toolkit apply panel-speed`. |
+
+### Why `panel-speed` is a concurrency fix, not a tuning knob
+
+`/opt/hiddify-manager/hiddify-panel/app.py` is five lines:
+
+```python
+bjoern.run(wsgi_app=hiddifypanel.create_app(), host="127.0.0.1", port=9000)
+```
+
+bjoern has no worker pool. Every admin on the box, every API client and every
+subscription fetch share **one** request slot, so the cost of the slowest handler is
+the cost of the whole panel. That is what turns a merely slow stats call into an
+outage:
+
+```
+one stats call         1.7 s        measured, s3, ~36k sockets
+dashboard poll         every 4 s    setInterval, does not wait for the reply
+one open tab           ~43% of the panel
+three open tabs        > 100%  ->  the queue never drains again
+```
+
+The symptom is unusually quiet. There is no 502, no timeout page and nothing in the
+access log, because the connections never reach the application at all — they sit in
+the kernel's accept queue (`ss -ltn 'sport = :9000'`, the `Recv-Q` column) until
+HAProxy's 50 s client timeout resets them. The panel then logs `Client N hit errno
+32/104` once per abandoned request; six figures of those lines in a day is this bug.
+Each abandoned request still burns its full slot, so the backlog never recovers on its
+own, and a reinstall "fixes" it only because the restart empties the queue.
+
+`ss -Hltn 'sport = :9000'` on any panel tells you where you stand: a `Recv-Q` above
+zero means requests are queuing right now.
+
+The module does not cache `system_stats()` itself. That function reports bandwidth as
+a delta against its own previous call and the template divides it by `refresh_s` to
+draw Mb/s, so handing out a cached snapshot would silently scale every bandwidth
+reading by `age / refresh_s`. It makes the call cheap instead, by rebinding the three
+slow names in that module's namespace — upstream's function body and output keys are
+untouched, so a panel upgrade that changes either keeps working.
 
 ### Why `logcap` is not just a logrotate file
 
