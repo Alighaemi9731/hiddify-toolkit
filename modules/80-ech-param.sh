@@ -187,51 +187,69 @@ _ec_http_probe() {
 # stopped working becomes a green light forever.
 _EC_PROBE_MSG=""
 _ec_live_probe() {                        # <value> -> 0 ok / 1 wrong / 2 unknown
-  local want="$1" path uuid dom body tls_lines hit bad
+  local want="$1" path uuid dom body real tls hit bad tried=0
   _EC_PROBE_MSG=""
   command -v curl >/dev/null 2>&1 || { _EC_PROBE_MSG="curl not installed"; return 2; }
 
-  path="$(python3 - <<'PY' 2>/dev/null
-import json
+  path="$(python3 -c 'import json
 try:
     c = json.load(open("/opt/hiddify-manager/current.json"))
     h = c.get("chconfigs", {}).get("0") or c.get("hconfigs") or {}
     print(h.get("proxy_path_client") or "")
 except Exception:
-    print("")
-PY
-)" || path=""
+    print("")' 2>/dev/null)" || path=""
   [ -n "$path" ] || { _EC_PROBE_MSG="no proxy_path_client in current.json"; return 2; }
-
-  uuid="$(mysql -N -B -e 'select uuid from hiddifypanel.user limit 1' 2>/dev/null | head -1 | tr -dc 'a-f0-9-')"
-  [ -n "$uuid" ] || { _EC_PROBE_MSG="no user in the panel DB to build a sub link with"; return 2; }
 
   dom="$(mysql -N -B -e "select domain from hiddifypanel.domain where mode in ('cdn','direct') limit 1" 2>/dev/null | head -1 | tr -dc 'A-Za-z0-9.-')"
   [ -n "$dom" ] || { _EC_PROBE_MSG="no cdn/direct domain in the panel DB"; return 2; }
 
-  # A non-Hiddify UA, because the Hiddify app is served sing-box JSON and this
-  # module deliberately does not touch that format.
-  body="$(curl -ks --max-time 20 --resolve "$dom:443:127.0.0.1" \
-            -A 'v2rayNG/1.8.0' "https://$dom/$path/$uuid/sub/" 2>/dev/null)" || body=""
-  [ -n "$body" ] || { _EC_PROBE_MSG="could not fetch a subscription from $dom"; return 2; }
+  # Any single user will NOT do. An expired or disabled one is served nothing but
+  # the usage/expiry pseudo-configs, and one of those carries `security=tls` while
+  # never passing through the link builder — so picking `limit 1` reads as "the
+  # patch does not work" on a box where it does. Walk the most recently seen
+  # enabled users and take the first whose subscription renders a real config.
+  real=""
+  for uuid in $(mysql -N -B -e "select uuid from hiddifypanel.user where enable=1 order by last_online desc limit 5" 2>/dev/null | tr -dc 'a-f0-9-\n'); do
+    [ -n "$uuid" ] || continue
+    tried=$(( tried + 1 ))
+    body="$(curl -ks --max-time 20 --resolve "$dom:443:127.0.0.1" \
+              -A 'v2rayNG/1.8.0' "https://$dom/$path/$uuid/sub/" 2>/dev/null)" || body=""
+    [ -n "$body" ] || continue
+    # The pseudo-configs are identifiable by the SNI the panel invents for them.
+    real="$(printf '%s\n' "$body" | grep 'security=' | grep -vF 'fake_ip_for_sub_link')" || real=""
+    [ -n "$real" ] && break
+  done
 
-  tls_lines="$(printf '%s\n' "$body" | grep -c 'security=tls')" || tls_lines=0
-  [ "$tls_lines" != "0" ] || { _EC_PROBE_MSG="the subscription carries no security=tls config to check"; return 2; }
+  if [ "$tried" = "0" ]; then
+    _EC_PROBE_MSG="no enabled user in the panel DB to build a sub link with"
+    return 2
+  fi
+  if [ -z "$real" ]; then
+    _EC_PROBE_MSG="none of the $tried newest enabled users renders a real config (all quota/date limited?)"
+    return 2
+  fi
 
-  hit="$(printf '%s\n' "$body" | grep -c "ech=$want")" || hit=0
+  tls="$(printf '%s\n' "$real" | grep -c 'security=tls')" || tls=0
+  [ "$tls" != "0" ] || { _EC_PROBE_MSG="the subscription carries no security=tls config to check"; return 2; }
+
+  hit="$(printf '%s\n' "$real" | grep -c "ech=$want")" || hit=0
   # Any ech= that is NOT ours means two writers of the same param, which is the
   # bug this module exists to end — report it rather than pass on the count above.
-  bad="$(printf '%s\n' "$body" | grep -o 'ech=[^&#]*' | grep -vcF "ech=$want")" || bad=0
+  bad="$(printf '%s\n' "$real" | grep -o 'ech=[^&#]*' | grep -vcF "ech=$want")" || bad=0
 
   if [ "$hit" = "0" ]; then
-    _EC_PROBE_MSG="$tls_lines TLS config(s) in the live subscription, none carrying ech=$want"
+    _EC_PROBE_MSG="$tls TLS config(s) in the live subscription, none carrying ech=$want"
+    return 1
+  fi
+  if [ "$hit" != "$tls" ]; then
+    _EC_PROBE_MSG="only $hit of $tls TLS config(s) carry ech=$want"
     return 1
   fi
   if [ "$bad" != "0" ]; then
     _EC_PROBE_MSG="$bad ech= param(s) in the live subscription with a value that is not ours"
     return 1
   fi
-  _EC_PROBE_MSG="$hit of $tls_lines TLS config(s) carry ech=$want"
+  _EC_PROBE_MSG="all $tls TLS config(s) carry ech=$want"
   return 0
 }
 
