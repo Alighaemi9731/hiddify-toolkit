@@ -40,6 +40,9 @@ module every 2 minutes.
 That timer is the heart of the design. Measured healing times after a real apply-config are in
 the 35–65 second range.
 
+For legacy client ports, `port-alias` also offers an **nft backend** with its own table.
+It survives Hiddify's iptables flushes during apply-config, without waiting for the guard.
+
 ---
 
 ## Modules
@@ -55,6 +58,39 @@ the 35–65 second range.
 | 7 | Keep an old port working | `port-alias` | Moving the panel from one port to another (say 8080 → 2095) cuts every client still on the old port at the next apply-config, because HAProxy only binds the ports the panel lists — and keeping both listed hands every user each config twice. Redirects the old port to the new one in the kernel (`nat/PREROUTING`, scoped to local destinations so forwarded wireguard/warp traffic is untouched), only while the new port is actually listening. Subscriptions list only the new port; old configs keep connecting. Non-interactive: `PORT_ALIASES=8080:2095 hiddify-toolkit apply port-alias`. |
 | 8 | Fixed `ech` value on TLS configs | `ech-param` | With the panel's ECH switch on, Hiddify resolves the SNI's HTTPS record and base64-encodes whatever ECH keys it finds into the link — for a CDN/fake SNI those are not the tunnel's keys, so the client ignores them or fails the handshake. Replaces that with one fixed value (default `udp://1.1.1.1`), which tells xray-core / sing-box to fetch ECH keys themselves at connect time. Only `security=tls` links are touched — never reality, never plain http. Patches panel code, so a Hiddify **update** wipes it — the guard re-applies it. |
 | 8 | Panel dashboard speed | `panel-speed` | The panel is served by **bjoern — one process, one thread, one request at a time**, and `system_stats()` costs ~1.4–2.2 s on a busy box (`psutil.cpu_percent(interval=1)` sleeps a full second *inside* the request; `psutil.net_connections()` walks every socket of every process). The admin dashboard polls it every 4 s with a plain `setInterval`, and `/admin/` itself calls it on every page load — so **one open dashboard tab eats ~40–55% of the whole panel and about three tabs wedge it**: the accept queue on `127.0.0.1:9000` grows past its 1024 backlog, the kernel starts dropping SYNs, and the panel stops loading in a browser with no error at all, just a spinner. Rebinds the slow calls (measured 1.9 s → 0.004 s) and slows the poll to 20 s. Patches panel code, so a Hiddify **update** wipes it — the guard re-applies it. Non-interactive: `PANEL_REFRESH_S=20 hiddify-toolkit apply panel-speed`. |
+
+### Moving HTTP to 80 while keeping old clients working
+
+Port 80 must already be served by the HTTP frontend. Install the aliases **before**
+removing the old ports from the panel:
+
+```bash
+PORT_ALIAS_BACKEND=nft PORT_ALIASES=8080:80,2052:80,2095:80 \
+  hiddify-toolkit apply port-alias
+```
+
+Then set the panel's HTTP ports to `80` and apply-config. Include every historical
+HTTP port in `PORT_ALIASES`, including any existing aliases; do not include a port
+used by another service or a TLS port. Subscriptions advertise 80, while existing
+clients can keep using the old ports. TLS ports remain separate.
+
+The opt-in `nft` backend requires `nft` and a modern Linux kernel (Ubuntu 22.04/24.04
+meet the kernel requirement). It installs an independent `inet hiddify_toolkit_port_alias`
+NAT table before the iptables NAT hook, scoped to local destinations for IPv4 and IPv6.
+Hiddify's iptables flushes leave this table intact. TCP redirects stay installed while
+HAProxy restarts; UDP redirects are included when the target listens on UDP. A boot
+service restores aliases before `hiddify-haproxy.service`, and the guard repairs drift.
+Normal service restarts during apply-config can still briefly interrupt connections.
+An external `nft flush ruleset` removes the table too; the guard then restores it.
+
+Existing installations keep the original `iptables` backend until explicitly migrated.
+The nft table is installed before the module removes its old iptables rules. Revert
+removes the owned table and boot service; restore the panel's old ports first if clients
+still depend on them. This module does not change panel settings itself.
+
+Run `sudo bash tests/port-alias-netns.sh` on Linux to verify migration, IPv4/IPv6 TCP,
+UDP, firewall flush survival, forwarding exclusion, restart handling, repair and revert
+inside disposable network and mount namespaces.
 
 ### Why `panel-speed` is a concurrency fix, not a tuning knob
 

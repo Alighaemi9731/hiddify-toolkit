@@ -116,6 +116,7 @@ do_reassert() {
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     IFS='|' read -r id _ guard _ < <(ht_module_meta "$f")
+    [ -z "${1:-}" ] || [ "$id" = "$1" ] || continue
     [ "$guard" = "yes" ] || continue
     ht_is_enabled "$id" || continue
     ht_module_run "$f" mod_reassert >/dev/null 2>&1 || { rc=1; ht_log "reassert FAILED $id"; }
@@ -209,7 +210,7 @@ cmd="${1:-menu}"
 case "$cmd" in
   menu)      need_root; ht_init_state; ht_adopt_applied; main_menu ;;
   status)    ht_init_state; do_status; do_status_verbose ;;
-  reassert)  need_root; ht_init_state; do_reassert ;;
+  reassert)  need_root; ht_init_state; do_reassert "${2:-}" ;;
   adopt)     need_root; ht_init_state; ht_adopt_applied; ht_guard_sync ;;
   apply|revert)
     need_root; ht_init_state

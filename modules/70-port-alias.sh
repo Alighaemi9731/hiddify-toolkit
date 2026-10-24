@@ -21,9 +21,14 @@
 #   - `-m addrtype --dst-type LOCAL`: PREROUTING also sees traffic this box only
 #     FORWARDS (wireguard / warp clients browsing to some site on port 8080). An
 #     unscoped REDIRECT would hijack those connections into our own HAProxy.
-#   - The redirect exists only while something LISTENS on the target port. If the
+#   - With the original iptables backend the redirect exists only while something
+#     LISTENS on the target port. If the
 #     panel still binds the old port and the new one is gone, removing the rule is
 #     what keeps the old port alive instead of redirecting it into nothing.
+#
+# PORT_ALIAS_BACKEND=nft opts into an independent nft table which survives
+# iptables flushes. TCP aliases remain installed across target restarts and are
+# restored before HAProxy at boot. The guard repairs changes to the owned table.
 #
 # The firewall needs no change: nat/PREROUTING rewrites the port before filter/INPUT
 # runs, so INPUT sees the TARGET port, which Hiddify already opens.
@@ -38,6 +43,79 @@ MOD_GUARD=yes
 }
 
 _PA_TAG="hiddify-toolkit:port-alias"
+_PA_NFT_TABLE="hiddify_toolkit_port_alias"
+_PA_BOOT_UNIT="/etc/systemd/system/hiddify-toolkit-port-alias.service"
+
+_pa_backend() { ht_conf_get backend iptables; }
+
+# A separate nftables table survives Hiddify's iptables flushes. Restore before
+# HAProxy starts at boot; do not remove TCP aliases while HAProxy is restarting.
+_pa_boot_install() {
+  local tmp
+  tmp="$(mktemp)" || return 1
+  cat > "$tmp" <<EOF
+[Unit]
+Description=Restore legacy Hiddify client ports
+After=network-pre.target
+Before=hiddify-haproxy.service
+
+[Service]
+Type=oneshot
+ExecStart=${HT_ROOT:-/opt/hiddify-toolkit}/bin/hiddify-toolkit reassert port-alias
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if ! cmp -s "$tmp" "$_PA_BOOT_UNIT"; then
+    install -m 644 "$tmp" "$_PA_BOOT_UNIT" || { rm -f "$tmp"; return 1; }
+    systemctl daemon-reload || { rm -f "$tmp"; return 1; }
+  fi
+  rm -f "$tmp"
+  systemctl enable hiddify-toolkit-port-alias.service >/dev/null 2>&1
+}
+
+_pa_nft_desired() {
+  local pair from to
+  while IFS= read -r pair; do
+    [ -n "$pair" ] || continue
+    from="${pair%%:*}"; to="${pair#*:}"
+    printf 'tcp %s %s\n' "$from" "$to"
+    _pa_listening udp "$to" && printf 'udp %s %s\n' "$from" "$to"
+  done < <(_pa_pairs)
+  return 0
+}
+
+_pa_nft_converge() (
+  # Serialize guard, boot and manual applies. Replace only our table atomically.
+  flock -x 9 || exit 1
+  local desired live snapshot tmp proto from to
+  desired="$(_pa_nft_desired)"
+  live="$(nft -s list table inet "$_PA_NFT_TABLE" 2>/dev/null)"
+  snapshot="$(printf '%s\n%s\n' "$desired" "$live")"
+  if [ -n "$live" ] && [ "$snapshot" = "$(cat /run/hiddify-toolkit-port-alias.snapshot 2>/dev/null)" ]; then
+    exit 0
+  fi
+  tmp="$(mktemp)" || exit 1
+  trap 'rm -f "$tmp"' EXIT
+  {
+    [ -z "$live" ] || printf 'delete table inet %s\n' "$_PA_NFT_TABLE"
+    printf 'table inet %s {\n chain prerouting {\n type nat hook prerouting priority -101; policy accept;\n' "$_PA_NFT_TABLE"
+    while read -r proto from to; do
+      [ -n "$proto" ] || continue
+      printf 'fib daddr type local %s dport %s counter redirect to :%s comment "%s"\n' "$proto" "$from" "$to" "$_PA_TAG"
+    done <<<"$desired"
+    printf '}\n}\n'
+  } > "$tmp"
+  nft -f "$tmp" || exit 1
+  live="$(nft -s list table inet "$_PA_NFT_TABLE")" || exit 1
+  printf '%s\n%s\n' "$desired" "$live" > /run/hiddify-toolkit-port-alias.snapshot
+) 9>/run/hiddify-toolkit-port-alias.lock
+
+_pa_nft_has() {
+  nft list chain inet "$_PA_NFT_TABLE" prerouting 2>/dev/null |
+    grep -E "fib daddr type local $1 dport $2 counter packets [0-9]+ bytes [0-9]+ redirect to :$3 comment" >/dev/null
+}
 
 # --------------------------------------------------------------- primitives ---
 
@@ -45,7 +123,7 @@ _pa_is_port() { [ "${1:-}" -ge 1 ] 2>/dev/null && [ "${1:-}" -le 65535 ] 2>/dev/
 
 # Normalize "8080:2095, 8880:2095" into one "from:to" per line; fail on anything else.
 _pa_parse() {                             # <spec>
-  local spec="${1//[[:space:]]/}" pair from to rc=0
+  local spec="${1//[[:space:]]/}" pair from to rc=0 seen=,
   [ -n "$spec" ] || return 1
   local IFS=,
   for pair in $spec; do
@@ -54,6 +132,10 @@ _pa_parse() {                             # <spec>
     if [ "$pair" = "$from" ] || ! _pa_is_port "$from" || ! _pa_is_port "$to" || [ "$from" = "$to" ]; then
       err "bad alias '$pair' — expected <old-port>:<new-port>, e.g. 8080:2095"; rc=1; continue
     fi
+    # Canonical decimal ports prevent nft syntax injection and ambiguous aliases.
+    [[ "$from" =~ ^[1-9][0-9]*$ && "$to" =~ ^[1-9][0-9]*$ ]] || { err "ports must be decimal integers"; return 1; }
+    case "$seen" in *",$from,"*) err "duplicate source port $from"; return 1 ;; esac
+    seen="$seen$from,"
     printf '%s:%s\n' "$from" "$to"
   done
   return $rc
@@ -83,8 +165,8 @@ PY
 }
 
 _pa_port_kind() {                         # <port> -> http | tls | ""
-  _pa_panel_ports http | grep -qx "$1" && { echo http; return; }
-  _pa_panel_ports tls  | grep -qx "$1" && { echo tls; return; }
+  _pa_panel_ports http | grep -x "$1" >/dev/null && { echo http; return; }
+  _pa_panel_ports tls  | grep -x "$1" >/dev/null && { echo tls; return; }
   echo ""
 }
 
@@ -94,6 +176,7 @@ _pa_rule() {                              # <proto> <from> <to>  -> rule spec (n
 }
 
 _pa_has() {                               # <ipt> <proto> <from> <to>
+  if [ "$(_pa_backend)" = nft ]; then _pa_nft_has "$2" "$3" "$4"; return; fi
   # shellcheck disable=SC2046
   "$1" -w -t nat -C PREROUTING $(_pa_rule "$2" "$3" "$4") >/dev/null 2>&1
 }
@@ -140,6 +223,17 @@ _pa_desired() {
 
 # Make the live rules equal the desired set. Prints nothing; returns 1 if a write failed.
 _pa_converge() {
+  if [ "$(_pa_backend)" = nft ]; then
+    _pa_boot_install && _pa_nft_converge || return 1
+    # Install the replacement before removing legacy redirects.
+    local old_ipt old_line
+    for old_ipt in iptables ip6tables; do
+      while IFS= read -r old_line; do
+        [ -z "$old_line" ] || _pa_delete_line "$old_ipt" "$old_line" || return 1
+      done < <(_pa_owned_lines "$old_ipt")
+    done
+    return 0
+  fi
   local ipt proto from to line keep rc=0 desired
   desired="$(_pa_desired)"
   for ipt in $(_pa_ipts); do
@@ -149,7 +243,7 @@ _pa_converge() {
       # `-m tcp` the rule was not written with, and a text compare would delete and
       # re-add the redirect on every guard tick.
       keep=0
-      printf '%s\n' "$desired" | grep -qxF -- "$(_pa_line_key "$line")" && keep=1
+      printf '%s\n' "$desired" | grep -xF -- "$(_pa_line_key "$line")" >/dev/null && keep=1
       [ "$keep" = "1" ] || _pa_delete_line "$ipt" "$line" || rc=1
     done < <(_pa_owned_lines "$ipt")
     while read -r proto from to; do
@@ -165,6 +259,11 @@ _pa_converge() {
 
 # nat sees only the FIRST packet of a connection, so this counts connections, not traffic.
 _pa_counter() {                           # <proto> <from> <to> -> connections redirected (IPv4)
+  if [ "$(_pa_backend)" = nft ]; then
+    nft list chain inet "$_PA_NFT_TABLE" prerouting 2>/dev/null | awk -v p="$1" -v f="$2" -v t=":$3" \
+      '$5 == p && $7 == f && $9 == "packets" && $15 == t {print $10}'
+    return
+  fi
   local num=6; [ "$1" = "udp" ] && num=17
   iptables -w -t nat -L PREROUTING -nvx 2>/dev/null | awk -v p="$1" -v n="$num" -v f="dpt:$2 " -v t="ports $3" '
     index($0, "port-alias") && ($4 == p || $4 == n) && index($0, f) && index($0 " ", t " ") { print $1; exit }'
@@ -173,11 +272,15 @@ _pa_counter() {                           # <proto> <from> <to> -> connections r
 # ------------------------------------------------------------------ status ----
 
 mod_status() {
+  printf 'backend         : %s\n' "$(_pa_backend)"
   local pair from to kind st="ABSENT" any=0 bad=0
   local pairs; pairs="$(_pa_pairs)"
   if [ -z "$pairs" ]; then
     printf 'aliases         : none configured\n'
     [ -n "$(_pa_owned_lines iptables)" ] && { printf 'leftover rules  : present\n'; echo "PARTIAL  rules left behind with no alias configured"; return 0; }
+    if command -v nft >/dev/null 2>&1 && nft list table inet "$_PA_NFT_TABLE" >/dev/null 2>&1; then
+      echo "PARTIAL  nft table left behind with no alias configured"; return 0
+    fi
     echo "ABSENT  no port alias"
     return 0
   fi
@@ -190,9 +293,11 @@ mod_status() {
       "$(_pa_has iptables tcp "$from" "$to" && echo live || echo missing)" \
       "$([ -n "$cnt" ] && printf '  (%s connections since boot/re-add)' "$cnt")"
     if _pa_has iptables tcp "$from" "$to"; then any=1; elif _pa_listening tcp "$to"; then bad=1; fi
-    _pa_listening tcp "$from" && printf '        note: %s is still bound by the panel itself — fine, but the alias only takes over once it is removed from the panel\n' "$from"
+    _pa_listening tcp "$from" && printf '        note: %s is still bound by the panel itself; incoming connections already use the redirect\n' "$from"
   done <<<"$pairs"
-  _pa_v6_usable || printf 'ipv6            : no usable ip6tables nat table (IPv4 only)\n'
+  if [ "$(_pa_backend)" != nft ]; then
+    _pa_v6_usable || printf 'ipv6            : no usable ip6tables nat table (IPv4 only)\n'
+  fi
   if [ "$bad" = "1" ]; then st="PARTIAL  a redirect is missing for a listening target"
   elif [ "$any" = "1" ]; then st="APPLIED  old ports redirected"
   else st="PARTIAL  configured, but no target port is listening"
@@ -221,7 +326,13 @@ _pa_pick() {
 }
 
 mod_apply() {
-  local PA_SPEC pairs pair from to kind
+  local PA_SPEC pairs pair from to kind backend
+  backend="${PORT_ALIAS_BACKEND:-$(_pa_backend)}"
+  case "$backend" in
+    nft) command -v nft >/dev/null 2>&1 || { err "nft is required for the nft backend"; return 1; } ;;
+    iptables) [ "$(_pa_backend)" != nft ] || { err "revert the nft backend before switching to iptables"; return 1; } ;;
+    *) err "PORT_ALIAS_BACKEND must be nft or iptables"; return 1 ;;
+  esac
   _pa_pick || return 1
   pairs="$(_pa_parse "$PA_SPEC")" || return 1
   [ -n "$pairs" ] || { err "no alias given"; return 1; }
@@ -240,20 +351,26 @@ mod_apply() {
     ok "alias $from -> $to ($kind)"
   done <<<"$pairs"
   ht_conf_set aliases "$(printf '%s' "$pairs" | paste -sd, -)"
+  ht_conf_set backend "$backend"
   _pa_converge || { err "could not install the redirect rules"; return 1; }
 }
 
 mod_verify() {
   local pair from to fail=0
+  if [ "$(_pa_backend)" = nft ]; then
+    if [ ! -f "$_PA_BOOT_UNIT" ] || ! systemctl is-enabled --quiet hiddify-toolkit-port-alias.service; then
+      err "legacy port boot service is not enabled"; return 1
+    fi
+  fi
   while IFS= read -r pair; do
     [ -n "$pair" ] || continue
     from="${pair%%:*}"; to="${pair#*:}"
-    _pa_listening tcp "$to" || continue
+    if [ "$(_pa_backend)" != nft ]; then _pa_listening tcp "$to" || continue; fi
     if ! _pa_has iptables tcp "$from" "$to"; then err "redirect $from -> $to is not live"; fail=1; continue; fi
     # With INPUT DROP (the panel's firewall switch) the TARGET port must be open, since
     # that is the port filter/INPUT sees after the rewrite.
-    if iptables -w -S INPUT 2>/dev/null | head -1 | grep -q -- '-P INPUT DROP' &&
-       ! iptables -w -S INPUT 2>/dev/null | grep -qE -- "-p tcp (-m tcp )?--dport $to (-m conntrack --ctstate NEW )?-j ACCEPT"; then
+    if iptables -w -S INPUT 2>/dev/null | grep -x -- '-P INPUT DROP' >/dev/null &&
+       ! iptables -w -S INPUT 2>/dev/null | grep -E -- "-p tcp (-m tcp )?--dport $to (-m conntrack --ctstate NEW )?-j ACCEPT" >/dev/null; then
       err "firewall is on and does not accept tcp/$to — redirected clients would be dropped"; fail=1
     fi
   done < <(_pa_pairs)
@@ -262,6 +379,15 @@ mod_verify() {
 
 mod_revert() {
   local ipt line rc=0
+  if command -v nft >/dev/null 2>&1 && nft list table inet "$_PA_NFT_TABLE" >/dev/null 2>&1; then
+    nft delete table inet "$_PA_NFT_TABLE" || rc=1
+  fi
+  if [ -f "$_PA_BOOT_UNIT" ]; then
+    systemctl disable --now hiddify-toolkit-port-alias.service >/dev/null 2>&1
+    rm -f "$_PA_BOOT_UNIT"
+    systemctl daemon-reload
+  fi
+  rm -f /run/hiddify-toolkit-port-alias.snapshot
   for ipt in iptables ip6tables; do
     command -v "$ipt" >/dev/null 2>&1 || continue
     while IFS= read -r line; do
