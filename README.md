@@ -294,3 +294,17 @@ Two rules worth internalising, both learned the hard way on production boxes:
 ## License
 
 MIT
+
+## CDN domain matching the server IP (Hiddify 12)
+
+Enable `hiddify-toolkit apply cdn-same-ip` to accept **CDN** and **Auto CDN IP**
+domains whose DNS resolves to the origin server. This removes only the origin-IP
+mismatch restriction. DNS resolution and Direct-mode matching remain checked.
+Accepting the domain does not enable a CDN or change DNS, TLS, proxy routes or ports.
+
+The patch survives Apply Config. The guard checks every two minutes and repairs
+it after panel package replacement, skipping the active installation window.
+Unknown code/layouts fail closed rather than disabling unrelated validation.
+Reasserting an intact patch does not restart the panel. A changed patch restarts
+only an already-running panel. To restore the stock check:
+`hiddify-toolkit revert cdn-same-ip`.
