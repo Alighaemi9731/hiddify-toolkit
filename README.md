@@ -308,3 +308,17 @@ Unknown code/layouts fail closed rather than disabling unrelated validation.
 Reasserting an intact patch does not restart the panel. A changed patch restarts
 only an already-running panel. To restore the stock check:
 `hiddify-toolkit revert cdn-same-ip`.
+
+## Direct domains pointing to another IP (Hiddify 12)
+
+`hiddify-toolkit apply direct-any-ip` removes only the requirement that a Direct
+domain resolve to this server. DNS resolution must still succeed. This does not
+change DNS, the client destination, routing, or certificate issuance: a domain
+pointing elsewhere still connects there unless the client overrides its address.
+The CDN check is independent and controlled by `cdn-same-ip`.
+
+The patch survives Apply Config. The guard repairs it after panel package replacement
+outside the installation window. An intact patch causes no restart; changing the
+patch restarts an already-running panel. Unknown source layouts are rejected.
+Use `hiddify-toolkit revert direct-any-ip` to restore the stock Direct check without
+removing other patches to DomainAdmin.py.
