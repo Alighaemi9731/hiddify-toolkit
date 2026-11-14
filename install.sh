@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Toolkit 2 supports the Hiddify 14.2 layout. For Hiddify 12 use tag v1.8.2.
 set -euo pipefail
-REF=main
+REF=""
 OPEN_MENU=1
 ARCHIVE=""
 while [ $# -gt 0 ]; do
@@ -26,9 +26,67 @@ if [ -n "$ARCHIVE" ]; then
   mkdir "$TMP/source"
   tar xzf "$TMP/source.tgz" -C "$TMP/source"
 else
+  if [ -z "$REF" ]; then
+# >>> release resolver
+    REF="$(python3 - <<'PYRESOLVE'
+import json
+import re
+import sys
+import urllib.request
+
+
+def select_release(records):
+    candidates = []
+    for release in records:
+        tag = release.get('tag_name', '')
+        match = re.fullmatch(r'v2\.(\d+)\.(\d+)', tag)
+        if match and not release.get('draft') and not release.get('prerelease') and release.get('published_at'):
+            candidates.append(((int(match[1]), int(match[2])), tag))
+    return max(candidates)[1] if candidates else None
+
+
+def latest_release(fetch):
+    releases = []
+    page = 1
+    while True:
+        records = fetch(page)
+        if not isinstance(records, list):
+            raise ValueError('GitHub returned an invalid release list')
+        releases.extend(records)
+        if len(records) < 100:
+            break
+        page += 1
+    tag = select_release(releases)
+    if not tag:
+        raise ValueError('No published stable Toolkit 2 release for Hiddify 14 was found')
+    return tag
+
+
+def fetch_page(page):
+    url = f'https://api.github.com/repos/Alighaemi9731/hiddify-toolkit/releases?per_page=100&page={page}'
+    request = urllib.request.Request(url, headers={'User-Agent': 'hiddify-toolkit-installer', 'Accept': 'application/vnd.github+json'})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.load(response)
+
+
+if __name__ == '__main__':
+    try:
+        print(latest_release(fetch_page))
+    except Exception as exc:
+        sys.exit(f'Cannot resolve the latest Toolkit 2 release: {exc}')
+PYRESOLVE
+)"
+# <<< release resolver
+  fi
+  echo "Installing release/ref: $REF"
   curl -fsSL --max-time 90 "https://codeload.github.com/Alighaemi9731/hiddify-toolkit/tar.gz/$REF" -o "$TMP/source.tgz"
   mkdir "$TMP/source"
   tar xzf "$TMP/source.tgz" -C "$TMP/source" --strip-components=1
+fi
+SOURCE_VERSION="$(cat "$TMP/source/VERSION")"
+[[ "$SOURCE_VERSION" =~ ^2\.[0-9]+\.[0-9]+$ ]] || { echo 'Refusing a release outside the Toolkit 2 / Hiddify 14 channel'; exit 1; }
+if [[ "$REF" =~ ^v2\.[0-9]+\.[0-9]+$ ]] && [ "$SOURCE_VERSION" != "${REF#v}" ]; then
+  echo 'Downloaded version does not match the selected release'; exit 1
 fi
 python3 "$TMP/source/lib/toolkit.py" preflight
 if [ -d /var/lib/hiddify-toolkit/enabled ] && find /var/lib/hiddify-toolkit/enabled -type f -print -quit | grep -q .; then

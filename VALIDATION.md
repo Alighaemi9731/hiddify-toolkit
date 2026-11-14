@@ -78,3 +78,12 @@ Private acceptance evidence and original source copies are retained on the test
 server in `/root/ht-v2-acceptance`, not in the public release. They contain no
 published API credentials. The seven Hiddify 12 servers were not upgraded or
 modified as part of this release.
+
+## Installer update: 2.0.1
+
+The six features are unchanged. Four additional installer tests bring the unit
+suite to **19 passing tests**: numeric stable-v2 selection, release pagination,
+missing-channel refusal and invalid/API-error response refusal. The default
+installer now selects a published stable v2 release, never unreleased main,
+v1 releases, other major releases, drafts or prereleases. Source VERSION must
+belong to v2 and match an explicitly selected v2 tag. ShellCheck and diff checks pass.

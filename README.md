@@ -6,8 +6,12 @@ Toolkit 2 does not support Hiddify 12. For those servers keep [v1.8.2](https://g
 ## Install
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Alighaemi9731/hiddify-toolkit/main/install.sh) --ref v2.0.0
+bash <(curl -fsSL https://raw.githubusercontent.com/Alighaemi9731/hiddify-toolkit/main/install.sh)
 ```
+
+The one-line command selects the newest published stable **v2.x.x** release for Hiddify 14.
+It skips drafts, prereleases, v1 (Hiddify 12), and other major versions; it never silently falls back to unreleased main code.
+The update command and menu use the same release selection. For an explicit rollback, `--ref v2.0.0` remains available.
 
 Requires root, systemd, Python 3, curl, tar, iproute2 and nftables (the tested Hiddify installation includes them).
 The installer verifies the panel version, interpreter, paths and all patch signatures **before replacing existing toolkit code**.
@@ -38,7 +42,7 @@ hiddify-toolkit                         # interactive six-feature menu
 hiddify-toolkit status
 hiddify-toolkit revert cdn-same-ip       # restore only this check
 hiddify-toolkit apply cdn-same-ip
-hiddify-toolkit update                  # updates from main; preserves saved choices
+hiddify-toolkit update                  # installs latest stable v2 release; preserves choices
 hiddify-toolkit uninstall               # revert all owned changes and remove toolkit
 ```
 
