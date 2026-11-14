@@ -1,324 +1,105 @@
-# hiddify-toolkit
+# Hiddify Toolkit 2
 
-One menu for the fixes a Hiddify panel server needs after install — and, more importantly,
-**a way to make those fixes stick**.
+Six focused features for **Hiddify Manager/Panel 14.2.x** (live validated on **14.2.0**).
+Toolkit 2 does not support Hiddify 12. For those servers keep [v1.8.2](https://github.com/Alighaemi9731/hiddify-toolkit/releases/tag/v1.8.2).
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Alighaemi9731/hiddify-toolkit/main/install.sh)
-```
-
-Run it right after you install a panel. It installs to `/opt/hiddify-toolkit`, puts
-`hiddify-toolkit` on your `PATH`, and opens the menu. Re-run the same line any time to upgrade —
-your enabled modules, their settings and their backups are preserved.
-
----
-
-## The problem this exists to solve
-
-Every fix you apply by hand to a Hiddify box gets quietly undone.
-
-`/opt/hiddify-manager/common/install.sh` runs on **every apply-config, every update, and every
-reboot** (via `/etc/cron.d/hiddify_reinstall_on_reboot`). On each run it:
-
-- re-links its own `sysctl.conf` into `/etc/sysctl.d/` and runs `sysctl --system`
-- then **imperatively** runs `sysctl -w net.ipv6.conf.*.disable_ipv6=0`
-- rebuilds the iptables ruleset from scratch
-- re-renders every xray / sing-box config from its `.j2` templates
-
-Two consequences that catch people out:
-
-1. **A file in `/etc/sysctl.d/` alone can never hold a value that `install.sh` also sets with
-   `sysctl -w`.** The file is applied, and then overwritten seconds later by the imperative
-   write. Your config looks correct on disk while the live kernel value is the opposite.
-2. **Any iptables rule you add is simply gone** after the next apply-config.
-
-So this toolkit does two things. Files it owns are named `zz-*` so that when Hiddify *does* run
-`sysctl --system`, ours sort last and win. And everything else is re-asserted by a single
-systemd timer, `hiddify-toolkit-guard.timer`, which re-runs the `reassert` step of every enabled
-module every 2 minutes.
-
-That timer is the heart of the design. Measured healing times after a real apply-config are in
-the 35–65 second range.
-
-For legacy client ports, `port-alias` also offers an **nft backend** with its own table.
-It survives Hiddify's iptables flushes during apply-config, without waiting for the guard.
-
----
-
-## Modules
-
-| # | Module | id | What it does |
-|---|--------|-----|--------------|
-| 1 | Kernel & network tuning | `tuning` | Hiddify pins `sysctl` values for a small VM and they never scale when you resize. Re-computes `tcp_mem`, TIME_WAIT buckets, conntrack, `file-max`, backlogs and ephemeral ports from actual RAM/CPU; preloads `nf_conntrack` (Hiddify's `net.netfilter.*` lines silently fail without it); turns on RPS/RFS (a single-queue virtio NIC otherwise pins all packet work to one core); adds the logrotate Hiddify ships without; stops the `hiddify-cli` crash loop. |
-| 2 | Disable IPv6 permanently | `ipv6` | For boxes with no working IPv6, where dual-stack services (Google/Gemini) break because clients push AAAA traffic the server cannot route. Beats Hiddify's `sysctl -w …=0`, which no config file can. |
-| 3 | Reality domain ALPN fix | `reality-alpn` | Lets the panel accept Reality SNI domains that only speak `http/1.1`. Patches panel code, so a Hiddify **update** wipes it — the guard notices and re-applies. |
-| 4 | Choose the outbound IP | `outbound-ip` | Detects every IPv4 on the box, lets you pick one, and sends all **outbound** traffic through it while **inbound stays on the existing address** — no DNS change, no client-config change. Use it when your main IP picks up a bad reputation and a service starts refusing it. |
-| 5 | Log disk-space guard | `logcap` | Hiddify ships no rotation for `/opt/hiddify-manager/log`, and one stuck client socket makes the panel write ~4 MB/s into it until the disk is full and the panel stops opening. Holds every file in that tree under a cap and the tree itself under a budget, re-checked every 2 minutes instead of once a day, and caps `systemd-journald`, which ships uncapped at 10% of the filesystem. |
-| 6 | Trailing dot in domain names | `fakedomain-dot` | The panel refuses a domain written as `fast.com.` ("Should be a valid domain"), so you cannot ship configs whose `Host` header carries the root dot. Frees exactly that one form. Patches panel code, so a Hiddify **update** wipes it — the guard re-applies it. |
-| 7 | Keep an old port working | `port-alias` | Moving the panel from one port to another (say 8080 → 2095) cuts every client still on the old port at the next apply-config, because HAProxy only binds the ports the panel lists — and keeping both listed hands every user each config twice. Redirects the old port to the new one in the kernel (`nat/PREROUTING`, scoped to local destinations so forwarded wireguard/warp traffic is untouched), only while the new port is actually listening. Subscriptions list only the new port; old configs keep connecting. Non-interactive: `PORT_ALIASES=8080:2095 hiddify-toolkit apply port-alias`. |
-| 8 | Fixed `ech` value on TLS configs | `ech-param` | With the panel's ECH switch on, Hiddify resolves the SNI's HTTPS record and base64-encodes whatever ECH keys it finds into the link — for a CDN/fake SNI those are not the tunnel's keys, so the client ignores them or fails the handshake. Replaces that with one fixed value (default `udp://1.1.1.1`), which tells xray-core / sing-box to fetch ECH keys themselves at connect time. Only `security=tls` links are touched — never reality, never plain http. Patches panel code, so a Hiddify **update** wipes it — the guard re-applies it. |
-| 8 | Panel dashboard speed | `panel-speed` | The panel is served by **bjoern — one process, one thread, one request at a time**, and `system_stats()` costs ~1.4–2.2 s on a busy box (`psutil.cpu_percent(interval=1)` sleeps a full second *inside* the request; `psutil.net_connections()` walks every socket of every process). The admin dashboard polls it every 4 s with a plain `setInterval`, and `/admin/` itself calls it on every page load — so **one open dashboard tab eats ~40–55% of the whole panel and about three tabs wedge it**: the accept queue on `127.0.0.1:9000` grows past its 1024 backlog, the kernel starts dropping SYNs, and the panel stops loading in a browser with no error at all, just a spinner. Rebinds the slow calls (measured 1.9 s → 0.004 s) and slows the poll to 20 s. Patches panel code, so a Hiddify **update** wipes it — the guard re-applies it. Non-interactive: `PANEL_REFRESH_S=20 hiddify-toolkit apply panel-speed`. |
-
-### Moving HTTP to 80 while keeping old clients working
-
-Port 80 must already be served by the HTTP frontend. Install the aliases **before**
-removing the old ports from the panel:
+## Install
 
 ```bash
-PORT_ALIAS_BACKEND=nft PORT_ALIASES=8080:80,2052:80,2095:80 \
-  hiddify-toolkit apply port-alias
+bash <(curl -fsSL https://raw.githubusercontent.com/Alighaemi9731/hiddify-toolkit/main/install.sh) --ref v2.0.0
 ```
 
-Then set the panel's HTTP ports to `80` and apply-config. Include every historical
-HTTP port in `PORT_ALIASES`, including any existing aliases; do not include a port
-used by another service or a TLS port. Subscriptions advertise 80, while existing
-clients can keep using the old ports. TLS ports remain separate.
+Requires root, systemd, Python 3, curl, tar, iproute2 and nftables (the tested Hiddify installation includes them).
+The installer verifies the panel version, interpreter, paths and all patch signatures **before replacing existing toolkit code**.
+Legacy Toolkit 1 installations with enabled modules must be reverted/uninstalled using version 1 first.
+Nothing is automatically changed on your other servers by publishing a release.
 
-The opt-in `nft` backend requires `nft` and a modern Linux kernel (Ubuntu 22.04/24.04
-meet the kernel requirement). It installs an independent `inet hiddify_toolkit_port_alias`
-NAT table before the iptables NAT hook, scoped to local destinations for IPv4 and IPv6.
-Hiddify's iptables flushes leave this table intact. TCP redirects stay installed while
-HAProxy restarts; UDP redirects are included when the target listens on UDP. A boot
-service restores aliases before `hiddify-haproxy.service`, and the guard repairs drift.
-Normal service restarts during apply-config can still briefly interrupt connections.
-An external `nft flush ruleset` removes the table too; the guard then restores it.
+| Feature | ID | Installation default |
+|---|---|---|
+| Offer both h2 and http/1.1 for Reality's TLS check | `reality-alpn` | **On** |
+| Choose an assigned secondary public IPv4 for outbound traffic | `outbound-ip` | Off |
+| Accept a single trailing dot, e.g. `example.com.` | `fakedomain-dot` | **On** |
+| Accept CDN domains resolving to the server IP | `cdn-same-ip` | **On** |
+| Accept Direct domains resolving to a different IP | `direct-any-ip` | **On** |
+| Keep legacy TCP client ports answering on the HTTP/TLS gateways | `port-alias` | Off |
 
-Existing installations keep the original `iptables` backend until explicitly migrated.
-The nft table is installed before the module removes its old iptables rules. Revert
-removes the owned table and boot service; restore the panel's old ports first if clients
-still depend on them. This module does not change panel settings itself.
+These are the only six features. Kernel tuning, IPv6 control, log cleanup, dashboard modifications, fixed ECH and WARP are not included.
+The four defaults are applied as a validated batch with at most one panel restart. Existing proxy cores are not restarted by toolkit patch operations.
+A panel restart can briefly interrupt panel requests and subscription generation; Hiddify may run its own database migrations when it starts.
 
-Run `sudo bash tests/port-alias-netns.sh` on Linux to verify migration, IPv4/IPv6 TCP,
-UDP, firewall flush survival, forwarding exclusion, restart handling, repair and revert
-inside disposable network and mount namespaces.
+The domain patches remove only their specific restrictions. DNS must still resolve; other domain/proxy validations remain.
+Allowing a name to be saved does not change its DNS, client destination, CDN service or certificate issuance.
+The trailing-dot patch applies to the Admin V2 Domains API; the initial quick-setup wizard is outside this feature.
 
-### Why `panel-speed` is a concurrency fix, not a tuning knob
-
-`/opt/hiddify-manager/hiddify-panel/app.py` is five lines:
-
-```python
-bjoern.run(wsgi_app=hiddifypanel.create_app(), host="127.0.0.1", port=9000)
-```
-
-bjoern has no worker pool. Every admin on the box, every API client and every
-subscription fetch share **one** request slot, so the cost of the slowest handler is
-the cost of the whole panel. That is what turns a merely slow stats call into an
-outage:
-
-```
-one stats call         1.7 s        measured, s3, ~36k sockets
-dashboard poll         every 4 s    setInterval, does not wait for the reply
-one open tab           ~43% of the panel
-three open tabs        > 100%  ->  the queue never drains again
-```
-
-The symptom is unusually quiet. There is no 502, no timeout page and nothing in the
-access log, because the connections never reach the application at all — they sit in
-the kernel's accept queue (`ss -ltn 'sport = :9000'`, the `Recv-Q` column) until
-HAProxy's 50 s client timeout resets them. The panel then logs `Client N hit errno
-32/104` once per abandoned request; six figures of those lines in a day is this bug.
-Each abandoned request still burns its full slot, so the backlog never recovers on its
-own, and a reinstall "fixes" it only because the restart empties the queue.
-
-`ss -Hltn 'sport = :9000'` on any panel tells you where you stand: a `Recv-Q` above
-zero means requests are queuing right now.
-
-The module does not cache `system_stats()` itself. That function reports bandwidth as
-a delta against its own previous call and the template divides it by `refresh_s` to
-draw Mb/s, so handing out a cached snapshot would silently scale every bandwidth
-reading by `age / refresh_s`. It makes the call cheap instead, by rebinding the three
-slow names in that module's namespace — upstream's function body and output keys are
-untouched, so a panel upgrade that changes either keeps working.
-
-### Why `logcap` is not just a logrotate file
-
-The `tuning` module already drops `/etc/logrotate.d/hiddify-manager` with `size 100M`, and
-that is not enough, for two reasons that only show up on a real box:
-
-- **`size` is a condition logrotate evaluates *when it runs*,** and on Ubuntu it runs from
-  `logrotate.timer`, `OnCalendar=daily`. The panel's EPIPE spin loop writes ~4 MB/s. Between
-  two daily runs that is ~345 GB — the disk dies long before `rotate 3` gets a turn.
-- **Rotation leaves the evidence behind.** Measured on a live panel: a 321 MB
-  `hiddify_panel.err.log.1`, 14,639,476 of whose 14,639,588 lines were the single string
-  `Client <n> hit errno <n>`. It was a *rotated* copy, which logrotate's own `size` clause
-  never looks at again, and nothing else was watching it.
-
-So the ceiling is enforced on the 2-minute guard cycle, over the whole tree rather than just
-the live `*.log` files.
-
-**The one non-obvious rule inside it:** size means *allocated blocks*, never `stat -c %s`.
-`hiddify-panel.service` redirects with `StandardError=file:`, and systemd's `file:` opens
-**without** `O_APPEND` — so after a truncate the service keeps writing at its old offset and
-punches a hole. The file is now sparse: its apparent size is unchanged and still climbing,
-while its real cost is a few hundred KB. (Measured on one box: 2,150,617 bytes "size",
-3,440 512-byte blocks — 1.7 MB of actual disk.) Cap on the apparent size and the module
-would re-truncate the same file every two minutes forever, reclaiming nothing.
-
-**And the one nothing on the filesystem can see.** Deleting a live log with `rm` — the
-obvious manual cure — frees nothing: the writer keeps its fd, so the inode lives on with no
-name, invisible to `ls`, `du`, `find`, logrotate and the sweep above, and still growing.
-Measured on a panel while this module was being written: **8,282 MB of allocated disk
-(146 GB apparent) behind one `hiddify-panel` fd, on a box whose visible log tree was 16 KB.**
-`df` climbed with nothing to point at. So the sweep also walks `/proc/<pid>/fd` for links
-ending in `" (deleted)"` that point into the log tree and truncates those through `/proc`,
-which reclaims the space with **no restart and no outage** (proven live: 14 GB used → 4.5 GB,
-`hiddify-panel` never left `active`). Read-only fds are reported and never touched.
-
-Live `*.log` files are **truncated, never deleted** — the writer holds the fd, so unlinking
-frees zero bytes until the service restarts. Rotated copies have no fd and are deleted,
-oldest first. `*.lock` (above all `0-install.lock`), `*.pid` and `*.sock` are never touched,
-and any name the module does not recognise is counted against the budget and left alone.
-
-Limits live in `/var/lib/hiddify-toolkit/conf/logcap.conf` (`file_mb`, `dir_mb`,
-`journal_mb`; `journal_mb=0` leaves journald to somebody else). Defaults: 100 MB per file,
-4x that for the tree, 512 MB of journal.
-
-### What `fakedomain-dot` actually buys you, and what it does not
-
-The block is one wtforms `Regexp` in `hiddifypanel/panel/admin/DomainAdmin.py` whose first
-alternative has to end at the TLD. The module appends `\.?` to that alternative and nothing
-else — a single optional trailing dot. `fast.com.` is accepted, `fast.com..` is still refused,
-and plain domains, wildcards, IPv4 and the empty value behave exactly as before. `mod_verify`
-pulls the live pattern back out of the file and asserts all six of those cases, so a patch that
-lands but changes the meaning is rolled back rather than shipped.
-
-Nothing downstream objects, which is why one regex is the whole fix. `on_model_change` only
-`.strip()`s whitespace; `_validate_domain_ips` returns early for Fake mode, so there is no DNS
-lookup to fail; `sni = host = domain` verbatim in `hutils/proxy/shared.py`; `need_valid_ssl` is
-false for Fake mode, so the config carries `allow_insecure`; and `replace_variables.sh` derives
-`fast.com.` right back out of `fast.com..crt`, so apply-config does not churn the certificate.
-
-**The part worth knowing before you rely on it.** The dot survives in the HTTP **Host** header
-and is stripped from the **TLS SNI**. That is not Hiddify — it is `hostnameInSNI()` in Go's
-`crypto/tls`, which RFC 6066 requires, and uTLS carries the identical function. Xray-core and
-sing-box are both Go, so every client built on them sends `Host: fast.com.` and `server_name:
-fast.com`. Measured against a local TLS server:
-
-```
-client sent   sni = "fast.com."   host = "fast.com."
-ClientHello   ServerName  = "fast.com"     <- dot stripped
-server saw    Host header = "fast.com."    <- dot intact
-```
-
-So this is a **Host-header** lever: useful on `ws`, `httpupgrade`, `xhttp` and `h2`, and of no
-effect on plain TCP+TLS or Reality, which carry no Host header at all. Getting a dot into the
-SNI on the wire would take a patched client core, not a patched panel.
-
-**apply-config does not undo this one; an update does.** `apply_configs.sh` runs
-`hiddify-panel/install.sh`, which only pip-installs when `HIDDIFY_PANLE_SOURCE_DIR` is set (it
-is not) — it just bounces the unit, and the patch rides through untouched. `update_panel()`
-runs `uv pip install -U --force-reinstall hiddifypanel`, which replaces the package outright.
-The guard therefore treats "the panel is not active" as *someone else is mid-apply*, never as
-evidence against its own patch, and it restarts the panel only when the panel was up before it
-touched anything.
-
-Every module has **apply** and **revert to previous state**, and every apply is verified —
-if verification fails, the change is rolled back automatically instead of being left half-live.
-
----
-
-## Usage
-
-```
-hiddify-toolkit                 # the menu
-hiddify-toolkit status          # state of every module
-hiddify-toolkit apply  ipv6     # non-interactive, for your own scripts
-hiddify-toolkit revert ipv6
-hiddify-toolkit reassert        # what the guard timer calls
-hiddify-toolkit update          # pull the newest version, keep state
-hiddify-toolkit uninstall       # revert everything, then remove the toolkit
-```
-
-State lives in `/var/lib/hiddify-toolkit`:
-
-```
-enabled/<id>      marker: this module is on, so the guard re-asserts it
-conf/<id>.conf    module settings (e.g. which outbound IP you chose)
-backup/<id>/      pristine copies of every file the module touched, taken once
-toolkit.log       what was applied/reverted, and when
-```
-
-`backup/` is written **once per file**. Re-applying never overwrites a pristine baseline with an
-already-modified copy — that is exactly how a revert silently starts restoring the broken state.
-
----
-
-## Adding a module
-
-Drop a file in `modules/`, named `<NN>-<id>.sh`. `NN` orders it in the menu. It is a sourced
-library — no shebang logic, no `main()`. Everything user-facing is English:
+## Commands
 
 ```bash
-MOD_ID="example"
-MOD_TITLE="Human readable title"
-MOD_DESC="One sentence describing what this changes."
-MOD_GUARD=yes                 # yes => mod_reassert runs every 2 min while enabled
-
-mod_status()   { ... ; echo "APPLIED"; }   # last line's FIRST word: APPLIED|ABSENT|PARTIAL
-mod_apply()    { ... }                     # 0 = success
-mod_verify()   { ... }                     # 0 = success; non-zero makes the core auto-revert
-mod_revert()   { ... }
-mod_reassert() { ... }                     # quiet, idempotent, fast
-mod_adopt()    { ... }                     # OPTIONAL, see below
+hiddify-toolkit                         # interactive six-feature menu
+hiddify-toolkit status
+hiddify-toolkit revert cdn-same-ip       # restore only this check
+hiddify-toolkit apply cdn-same-ip
+hiddify-toolkit update                  # updates from main; preserves saved choices
+hiddify-toolkit uninstall               # revert all owned changes and remove toolkit
 ```
 
-`mod_adopt` is called when the toolkit finds a module already **APPLIED** on a box it never
-applied it to (the standalone scripts that predate this toolkit, a rebuilt server) and adopts
-it so the guard protects it. Adoption never runs `mod_apply`, so anything `mod_apply` would
-have *recorded* — a rollback baseline above all — was never recorded, and a later revert then
-silently leaves the change live. Implement `mod_adopt` to do that bookkeeping, and only that:
-it must not change the box.
+Reinstallation preserves explicit choices: if you revert a default feature, it stays off on the next installation.
+A clean installation turns the four defaults on. `install.sh --no-menu` works non-interactively.
+For offline deployments use `--archive /path/to/release.tgz` with an archive containing the project files at its root.
 
-Helpers available from the core: `say ok warn err dim`, `ht_conf_get` / `ht_conf_set`,
-`ht_backup` / `ht_backup_dir`, `ht_is_hiddify`, `ht_state_dir`.
+### Legacy ports (optional)
 
-Two rules worth internalising, both learned the hard way on production boxes:
+```bash
+hiddify-toolkit apply port-alias --aliases 8080:80,2052:80,2095:80,8443:443
+hiddify-toolkit revert port-alias
+```
 
-- **`mod_reassert` must never restart a service unless it actually re-applied something.**
-  It runs every 2 minutes; a naive implementation becomes a 2-minute restart loop.
-- **Insert firewall rules, do not append them.** Hiddify's firewall carries a blanket
-  `-A OUTPUT -p tcp -j ACCEPT`; anything appended after it never matches.
+TCP only. The target must be the standard gateway 80 or 443 and be listening when the feature is enabled.
+Old ports must be unprivileged and cannot collide with a listening TCP service or the panel's per-domain gateway ports.
+The module checks the current `generated/firewall.sh`; an unknown layout is rejected.
+If a later panel change claims an old port, the guard releases the toolkit alias table and reports a conflict.
+No domain or subscription entries are created, so the old ports are not advertised to new clients.
+QUIC/UDP and redirecting to arbitrary custom services are outside this feature.
 
----
+Independent `inet hiddify_toolkit_ports` NAT chains run after Hiddify's iptables NAT (native panel redirects take precedence), for IPv4 and IPv6.
+Rules only match **local destinations**; forwarded VPN traffic to another server's port is untouched.
+Loopback/local connections are covered as well. Filter policies and Hiddify's own rules are not changed.
 
-## Safety
+### Outbound IP (optional)
 
-- Every module is verified after apply and **auto-reverted** if the verification fails.
-- The `outbound-ip` module additionally proves the live user tunnel still answers before it
-  keeps a change, so a bad IP cannot silently black-hole your customers.
-- Nothing here touches xray, HAProxy, nginx or the database. `reality-alpn` restarts
-  `hiddify-panel` (admin UI + subscription serving blink for a few seconds; active VPN sessions
-  go through HAProxy/xray and are unaffected) and only when it actually re-patched.
-- Requires root, Ubuntu 22.04/24.04, systemd, `iptables`.
+```bash
+hiddify-toolkit apply outbound-ip --ip YOUR_ASSIGNED_SECONDARY_IPV4
+hiddify-toolkit revert outbound-ip
+```
 
-## License
+Only an already-assigned **different public IPv4 on the default-route interface** is accepted.
+The toolkit does not invent, attach or route provider IPs. It verifies the IP using a bound external request before applying SNAT,
+and an unbound request afterward; verification failure restores the previous choice.
+A server with one public IPv4 cannot use this feature until its provider assigns another.
 
-MIT
+The independent `ip hiddify_toolkit_egress` table changes only new original-direction IPv4 connections whose source is the primary public IP.
+LAN/local destinations and traffic sourced from VPN tunnel ranges are excluded. Inbound established connections keep their replies.
+This feature does not select WARP exit addresses or change explicitly bound secondary sources, DNS, default routes or IPv6 egress.
+A changed default route/address invalidates the saved choice and is reported rather than guessed.
 
-## CDN domain matching the server IP (Hiddify 12)
+## Persistence and ownership
 
-Enable `hiddify-toolkit apply cdn-same-ip` to accept **CDN** and **Auto CDN IP**
-domains whose DNS resolves to the origin server. This removes only the origin-IP
-mismatch restriction. DNS resolution and Direct-mode matching remain checked.
-Accepting the domain does not enable a CDN or change DNS, TLS, proxy routes or ports.
+- A marked systemd panel drop-in prepares enabled patches before **every panel start**, including Apply Config and package replacement followed by a restart.
+- The preparer validates all affected documents before writing. Each file is compiled using the panel interpreter, then atomically replaced with its permissions/owner preserved.
+- The guard checks every minute, skips a currently held Hiddify installation flock, and restarts an active panel only when it repaired a source change.
+- An intact installation causes no panel restart on reassert or reinstall.
+- The startup preparer is best-effort: an unknown future panel source logs an error and leaves files unchanged; it never prevents the panel from starting.
+  The guard/CLI report failure. Compatibility with untested future versions is not guaranteed.
+- Optional network tables survive Hiddify's iptables flush/restore. A boot unit restores enabled network rules before HAProxy without requiring the gateway to already be listening.
+- Revert uses exact inverses, preserving unrelated edits. The toolkit removes only its own drop-in, units, tables and state during uninstall.
+- Local state and original source backups are in `/var/lib/hiddify-toolkit`. No user credentials or traffic payloads are collected.
 
-The patch survives Apply Config. The guard checks every two minutes and repairs
-it after panel package replacement, skipping the active installation window.
-Unknown code/layouts fail closed rather than disabling unrelated validation.
-Reasserting an intact patch does not restart the panel. A changed patch restarts
-only an already-running panel. To restore the stock check:
-`hiddify-toolkit revert cdn-same-ip`.
+## Validation
 
-## Direct domains pointing to another IP (Hiddify 12)
+```bash
+python3 -m unittest discover -s tests -v
+shellcheck install.sh bin/hiddify-toolkit
+# Linux root only: isolated network-namespace NAT tests, never the host ruleset
+python3 tests/network_netns.py
+```
 
-`hiddify-toolkit apply direct-any-ip` removes only the requirement that a Direct
-domain resolve to this server. DNS resolution must still succeed. This does not
-change DNS, the client destination, routing, or certificate issuance: a domain
-pointing elsewhere still connects there unless the client overrides its address.
-The CDN check is independent and controlled by `cdn-same-ip`.
-
-The patch survives Apply Config. The guard repairs it after panel package replacement
-outside the installation window. An intact patch causes no restart; changing the
-patch restarts an already-running panel. Unknown source layouts are rejected.
-Use `hiddify-toolkit revert direct-any-ip` to restore the stock Direct check without
-removing other patches to DomainAdmin.py.
+See [VALIDATION.md](VALIDATION.md) for actual release acceptance results and limits.

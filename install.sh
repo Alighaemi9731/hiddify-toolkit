@@ -1,91 +1,58 @@
 #!/usr/bin/env bash
-# =============================================================================
-# hiddify-toolkit installer
-#
-#   bash <(curl -fsSL https://raw.githubusercontent.com/Alighaemi9731/hiddify-toolkit/main/install.sh)
-#
-# Installs to /opt/hiddify-toolkit, links `hiddify-toolkit` into PATH, and opens
-# the menu. Re-running upgrades in place: /var/lib/hiddify-toolkit (which modules
-# are enabled, their config and their backups) is never touched.
-#
-# Flags:  --no-menu   install/upgrade only, do not open the menu
-#         --ref REF   install a specific branch or tag (default: main)
-# =============================================================================
-set -uo pipefail
-
-REPO="Alighaemi9731/hiddify-toolkit"
-REF="main"
+# Toolkit 2 supports the Hiddify 14.2 layout. For Hiddify 12 use tag v1.8.2.
+set -euo pipefail
+REF=main
 OPEN_MENU=1
-DEST=/opt/hiddify-toolkit
-LINK=/usr/local/bin/hiddify-toolkit
-
+ARCHIVE=""
 while [ $# -gt 0 ]; do
   case "$1" in
+    --ref) REF="${2:?missing ref}"; shift ;;
     --no-menu) OPEN_MENU=0 ;;
-    --ref) REF="${2:-main}"; shift ;;
-    *) echo "unknown flag: $1" >&2; exit 2 ;;
+    --archive) ARCHIVE="${2:?missing local release archive}"; shift ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
   shift
 done
-
-[ "$(id -u)" -eq 0 ] || { echo "must run as root (use sudo)" >&2; exit 1; }
-
-need() { command -v "$1" >/dev/null 2>&1; }
-if ! need curl || ! need tar; then
-  echo "installing prerequisites (curl, tar)..."
-  apt-get update -qq >/dev/null 2>&1
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl tar >/dev/null 2>&1
-fi
-
+[ "$(id -u)" = 0 ] || { echo 'Run as root'; exit 1; }
+VERSION="$(cat /opt/hiddify-manager/VERSION)"
+[[ "$VERSION" =~ ^14\.2\.[0-9]+$ ]] || { echo "Toolkit 2 requires Hiddify 14.2.x. Hiddify 12: install tag v1.8.2."; exit 1; }
+for cmd in curl tar python3 nft ip ss systemctl; do
+  command -v "$cmd" >/dev/null || { echo "Missing prerequisite: $cmd"; exit 1; }
+done
 TMP="$(mktemp -d)"
-cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT
-
-echo "downloading $REPO@$REF ..."
-if ! curl -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF" -o "$TMP/src.tgz" &&
-   ! curl -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/tags/$REF"  -o "$TMP/src.tgz"; then
-  echo "download failed — check the repo name, the ref, and this server's connectivity" >&2
-  exit 1
+trap 'rm -r -- "$TMP"' EXIT
+if [ -n "$ARCHIVE" ]; then
+  cp -- "$ARCHIVE" "$TMP/source.tgz"
+  mkdir "$TMP/source"
+  tar xzf "$TMP/source.tgz" -C "$TMP/source"
+else
+  curl -fsSL --max-time 90 "https://codeload.github.com/Alighaemi9731/hiddify-toolkit/tar.gz/$REF" -o "$TMP/source.tgz"
+  mkdir "$TMP/source"
+  tar xzf "$TMP/source.tgz" -C "$TMP/source" --strip-components=1
 fi
-
-mkdir -p "$TMP/x"
-tar xzf "$TMP/src.tgz" -C "$TMP/x" --strip-components=1 || { echo "extract failed" >&2; exit 1; }
-[ -f "$TMP/x/bin/hiddify-toolkit" ] || { echo "archive looks wrong (no bin/hiddify-toolkit)" >&2; exit 1; }
-
-# Replace the CODE only. State lives in /var/lib/hiddify-toolkit and is deliberately
-# untouched, so an upgrade never forgets which modules are enabled.
-rm -rf "$DEST.old"
-[ -d "$DEST" ] && mv "$DEST" "$DEST.old"
-mkdir -p "$DEST"
-cp -a "$TMP/x/." "$DEST/"
-rm -rf "$DEST.old"
-
-chmod +x "$DEST/bin/hiddify-toolkit" 2>/dev/null
-chmod +x "$DEST"/modules/*.sh 2>/dev/null
-ln -sf "$DEST/bin/hiddify-toolkit" "$LINK"
-mkdir -p /var/lib/hiddify-toolkit/{enabled,conf,backup}
-
-# An upgrade must re-point the guard unit at the new tree and re-assert immediately,
-# otherwise a module stays "enabled" while nothing is actually re-applying it.
-# Adopt anything already applied on this box (by the old standalone scripts, or by a
-# previous install) so it gets a marker and therefore guard protection, then re-assert.
-"$LINK" adopt >/dev/null 2>&1 || true
-if [ -f /etc/systemd/system/hiddify-toolkit-guard.timer ]; then
-  "$LINK" reassert >/dev/null 2>&1
+python3 "$TMP/source/lib/toolkit.py" preflight
+if [ -d /var/lib/hiddify-toolkit/enabled ] && find /var/lib/hiddify-toolkit/enabled -type f -print -quit | grep -q .; then
+  echo 'Legacy Toolkit 1 modules are enabled. Revert/uninstall Toolkit 1 first.' >&2; exit 1
 fi
-
-echo
-echo "  installed: hiddify-toolkit v$(cat "$DEST/VERSION" 2>/dev/null || echo '?')  ->  $DEST"
-echo "  run it any time with:  hiddify-toolkit"
-echo
-
-# `curl ... | bash` leaves stdin consumed by the pipe, so an interactive menu would
-# read garbage and spin. Only open it when stdin is a real terminal.
-if [ "$OPEN_MENU" = "1" ]; then
-  if [ -t 0 ]; then
-    exec "$LINK"
+# Prevent concurrent installers. The guard's file lock is separate from this lock.
+exec 9>/run/hiddify-toolkit-installer.lock
+flock -n 9 || { echo 'Another toolkit installer is running'; exit 1; }
+DEST=/opt/hiddify-toolkit
+[ ! -e "$DEST.previous" ] || { echo "$DEST.previous already exists; inspect the previous installation"; exit 1; }
+if [ -d "$DEST" ]; then mv "$DEST" "$DEST.previous"; fi
+cp -a "$TMP/source" "$DEST"
+chmod +x "$DEST/bin/hiddify-toolkit"
+ln -sf "$DEST/bin/hiddify-toolkit" /usr/local/bin/hiddify-toolkit
+if ! "$DEST/bin/hiddify-toolkit" bootstrap; then
+  # bootstrap restores prior feature settings before returning an error.
+  rm -r -- "$DEST"
+  if [ -d "$DEST.previous" ]; then
+    mv "$DEST.previous" "$DEST"
   else
-    echo "  (non-interactive shell detected — start the menu with: hiddify-toolkit)"
-    echo
+    rm -- /usr/local/bin/hiddify-toolkit
   fi
+  echo 'Installation failed; prior code restored.' >&2; exit 1
 fi
+if [ -d "$DEST.previous" ]; then rm -r -- "$DEST.previous"; fi
+echo "Installed Hiddify Toolkit $(cat "$DEST/VERSION")"
+if [ "$OPEN_MENU" = 1 ] && [ -t 0 ]; then exec "$DEST/bin/hiddify-toolkit"; fi
