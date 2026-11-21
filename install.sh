@@ -90,6 +90,33 @@ SOURCE_VERSION="$(cat "$TMP/source/VERSION")"
 if [[ "$REF" =~ ^v2\.[0-9]+\.[0-9]+$ ]] && [ "$SOURCE_VERSION" != "${REF#v}" ]; then
   echo 'Downloaded version does not match the selected release'; exit 1
 fi
+# Older Toolkit versions cannot remove the new kernel/service controls.
+# >>> downgrade guard
+python3 - "$SOURCE_VERSION" <<'PYDOWNGRADE'
+import json
+import os
+from pathlib import Path
+import sys
+
+
+def check_downgrade(source_version, enabled, managed=False):
+    performance = {'tcp-memory', 'tcp-timewait', 'rpxy-nodelay'}
+    if tuple(map(int, source_version.split('.'))) < (2, 1, 0) and (managed or performance.intersection(enabled)):
+        raise ValueError('Revert tcp-memory, tcp-timewait and rpxy-nodelay using Toolkit 2.1 before downgrading to 2.0.x')
+
+
+if __name__ == '__main__':
+    try:
+        state = Path(os.environ.get('HT_STATE', '/var/lib/hiddify-toolkit'))
+        settings = state/'settings.json'
+        receipt = state/'performance.json'
+        enabled = json.loads(settings.read_text()).get('enabled', []) if settings.exists() else []
+        active = json.loads(receipt.read_text()) if receipt.exists() else {}
+        check_downgrade(sys.argv[1], enabled, bool(active.get('parameters') or active.get('nodelay')))
+    except Exception as exc:
+        sys.exit(f'Cannot prove safe downgrade: {exc}')
+PYDOWNGRADE
+# <<< downgrade guard
 python3 "$TMP/source/lib/toolkit.py" preflight
 if [ -d /var/lib/hiddify-toolkit/enabled ] && find /var/lib/hiddify-toolkit/enabled -type f -print -quit | grep -q .; then
   echo 'Legacy Toolkit 1 modules are enabled. Revert/uninstall Toolkit 1 first.' >&2; exit 1

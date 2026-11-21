@@ -78,7 +78,7 @@ Before enabling, a disposable cgroup test proves NODELAY on both directions, rep
 The owned sysctl file is `/etc/sysctl.d/zzzz-hiddify-toolkit-performance.conf`. Original runtime values, receipts and the locally-built helper live under `/var/lib/hiddify-toolkit`. The guard repairs enabled runtime settings after native configuration changes.
 Revert restores original sysctl values when they still match the last Toolkit value; it preserves externally changed runtime values. It removes only the owned BPF attachment and drop-in. Established sockets retain NODELAY until natural closure; new connections return to the application's normal behavior.
 Existing independent tuning (including older manually deployed performance helpers) is preserved; reverting Toolkit does not disable another tool's settings.
-Before downgrading to 2.0.x, revert all three performance options using 2.1 first, because older versions do not know how to remove them.
+Before downgrading to 2.0.x, revert all three performance options using 2.1 first, because older versions do not know how to remove them. The current installer rejects a downgrade while these options or their runtime receipts remain active, including a stale release-list response.
 
 Ubuntu 24 and 26 can have different kernels and capabilities. Compatibility is checked on the running host rather than inferred from the Ubuntu name. The profile leaves congestion control, installed qdiscs, MTU/MSS, offloads, IRQ/RPS and conntrack settings unchanged. A provider bottleneck or a bad client route still needs separate diagnosis; these options do not promise zero latency.
 

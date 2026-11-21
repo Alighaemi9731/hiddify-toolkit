@@ -96,11 +96,12 @@ An additional isolated NODELAY compatibility test passed on an Ubuntu **24.04**
 host running kernel **6.8.0-149-generic**, also x86_64. Native ARM64 builds are
 capability gated but were not live validated in this acceptance run.
 
-- **35 unit tests pass.** New coverage includes page-size/RAM budgets, larger
+- **39 unit tests pass.** New coverage includes page-size/RAM budgets, larger
   pre-existing values, independent revert, preservation of externally changed
   runtime values, sysctl/BPF failure rollback, missing ownership receipts,
   pending boot attachment, existing-socket repair, cached-helper architecture,
-  unavailable capability fallback, 2.0.x default migration and persisted opt-out.
+  unavailable capability fallback, 2.0.x default migration, persisted opt-out and
+  refusing downgrade/stale-release selection while performance controls are active.
 - The existing **10 real-packet namespace tests** pass on the Ubuntu 26 host.
   They leave production interfaces/routes/firewalls unchanged. Controlled tests
   of the installed panel TLS function accept HTTP/1.1 and h2 with TLS 1.3,

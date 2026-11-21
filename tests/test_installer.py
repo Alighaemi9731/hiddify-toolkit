@@ -6,6 +6,8 @@ INSTALLER=Path(__file__).resolve().parents[1]/'install.sh'
 source=re.search(r"# >>> release resolver.*?<<'PYRESOLVE'\n(.*?)\nPYRESOLVE",INSTALLER.read_text(),re.S)[1]
 env={'__name__':'installer_test'}
 exec(compile(source,str(INSTALLER),'exec'),env)
+guard=re.search(r"# >>> downgrade guard.*?<<'PYDOWNGRADE'\n(.*?)\nPYDOWNGRADE",INSTALLER.read_text(),re.S)[1]
+exec(compile(guard,str(INSTALLER),'exec'),env)
 
 def release(tag,**kw):
     return dict(tag_name=tag,draft=False,prerelease=False,published_at='2026-11-14T00:00:00Z',**kw)
@@ -23,5 +25,13 @@ class InstallerTests(unittest.TestCase):
             env['latest_release'](lambda page:[release('v1.8.2')])
     def test_api_failure_fails_without_fallback(self):
         with self.assertRaises(ValueError):env['latest_release'](lambda page:{'message':'API rate limit exceeded'})
+    def test_stale_release_cannot_downgrade_enabled_performance(self):
+        with self.assertRaisesRegex(ValueError,'Revert'):env['check_downgrade']('2.0.1',['tcp-memory'])
+    def test_managed_runtime_blocks_downgrade_even_if_settings_are_stale(self):
+        with self.assertRaises(ValueError):env['check_downgrade']('2.0.1',[],True)
+    def test_explicit_revert_allows_older_release(self):
+        self.assertIsNone(env['check_downgrade']('2.0.1',['reality-alpn'],False))
+    def test_current_release_preserves_enabled_performance(self):
+        self.assertIsNone(env['check_downgrade']('2.1.0',['tcp-memory'],True))
 
 if __name__=='__main__':unittest.main()
