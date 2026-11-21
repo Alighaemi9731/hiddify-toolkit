@@ -4,11 +4,13 @@ set -euo pipefail
 REF=""
 OPEN_MENU=1
 ARCHIVE=""
+SKIP_PERFORMANCE_DEFAULTS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --ref) REF="${2:?missing ref}"; shift ;;
     --no-menu) OPEN_MENU=0 ;;
     --archive) ARCHIVE="${2:?missing local release archive}"; shift ;;
+    --no-performance-defaults) SKIP_PERFORMANCE_DEFAULTS=1 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -101,7 +103,7 @@ if [ -d "$DEST" ]; then mv "$DEST" "$DEST.previous"; fi
 cp -a "$TMP/source" "$DEST"
 chmod +x "$DEST/bin/hiddify-toolkit"
 ln -sf "$DEST/bin/hiddify-toolkit" /usr/local/bin/hiddify-toolkit
-if ! "$DEST/bin/hiddify-toolkit" bootstrap; then
+if ! HT_SKIP_PERFORMANCE_DEFAULTS="$SKIP_PERFORMANCE_DEFAULTS" "$DEST/bin/hiddify-toolkit" bootstrap; then
   # bootstrap restores prior feature settings before returning an error.
   rm -r -- "$DEST"
   if [ -d "$DEST.previous" ]; then

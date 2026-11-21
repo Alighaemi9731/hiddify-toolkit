@@ -1,6 +1,7 @@
 import importlib.util
 import ipaddress
 import fcntl
+import os
 from pathlib import Path
 import re
 import sys
@@ -69,6 +70,7 @@ class LifecycleTests(unittest.TestCase):
         for feature,(rel,*_) in t.PATCHES.items():
             path=self.pkg/rel;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(fixture(feature))
         self.patches=[patch.object(t,'STATE',self.state),patch.object(t,'supported',return_value=(self.pkg,Path(sys.executable))),patch.object(t,'panel_active',return_value=True),patch.object(t,'restart_panel'),patch.object(t,'units'),patch.object(t,'network_sync'),patch.object(t,'installation_busy',return_value=False)]
+        self.patches += [patch.object(t.performance,'eligible_defaults',return_value=(list(t.performance.FEATURES),{})),patch.object(t.performance,'preflight'),patch.object(t.performance,'sync')]
         self.mocks=[p.start() for p in self.patches]
     def tearDown(self):
         for p in reversed(self.patches):p.stop()
@@ -109,6 +111,32 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'nft failure'):t.bootstrap()
         self.assertEqual(t.read_config()['enabled'],[])
         for feature,(rel,*_) in t.PATCHES.items():self.assertNotIn(t.PATCHES[feature][3],(self.pkg/rel).read_text())
+
+    def test_upgrade_adds_new_defaults_once_without_reenabling_old_panel_choices(self):
+        t.write_config({'initialized':True,'enabled':['direct-any-ip'],'aliases':[],'outbound':None})
+        t.bootstrap()
+        self.assertEqual(set(t.read_config()['enabled']),{'direct-any-ip',*t.performance.FEATURES})
+        t.revert('rpxy-nodelay');t.bootstrap()
+        self.assertNotIn('rpxy-nodelay',t.read_config()['enabled'])
+        self.assertNotIn('cdn-same-ip',t.read_config()['enabled'])
+
+    def test_unavailable_performance_does_not_block_panel_install(self):
+        self.mocks[7].return_value=([],{'rpxy-nodelay':'BPF unavailable'})
+        t.bootstrap()
+        self.assertEqual(set(t.read_config()['enabled']),set(t.PANEL_DEFAULTS))
+        self.assertEqual(t.read_config()['performance_defaults_skipped'],{'rpxy-nodelay':'BPF unavailable'})
+
+    def test_performance_failure_rolls_back_source_and_choices(self):
+        self.mocks[9].side_effect=[RuntimeError('BPF attach failed'),None]
+        with self.assertRaisesRegex(RuntimeError,'BPF attach failed'):t.bootstrap()
+        self.assertEqual(t.read_config()['enabled'],[])
+        for feature,(rel,*_) in t.PATCHES.items():self.assertNotIn(t.PATCHES[feature][3],(self.pkg/rel).read_text())
+
+    def test_explicit_installer_opt_out_survives_later_regular_install(self):
+        with patch.dict(os.environ,{'HT_SKIP_PERFORMANCE_DEFAULTS':'1'}):t.bootstrap()
+        t.bootstrap()
+        self.assertEqual(set(t.read_config()['enabled']),set(t.PANEL_DEFAULTS))
+        self.mocks[7].assert_not_called()
 
 class NetworkTests(unittest.TestCase):
     def test_bad_ports_and_injections_refused(self):

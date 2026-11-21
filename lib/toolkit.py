@@ -15,11 +15,15 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import performance
+
 ROOT = Path(__file__).resolve().parents[1]
 MANAGER = Path(os.environ.get('HT_MANAGER', '/opt/hiddify-manager'))
 STATE = Path(os.environ.get('HT_STATE', '/var/lib/hiddify-toolkit'))
 SYSTEMD = Path('/etc/systemd/system')
-DEFAULTS = ('reality-alpn', 'fakedomain-dot', 'cdn-same-ip', 'direct-any-ip')
+PANEL_DEFAULTS = ('reality-alpn', 'fakedomain-dot', 'cdn-same-ip', 'direct-any-ip')
+DEFAULTS = PANEL_DEFAULTS + performance.FEATURES
 FEATURES = {
     'reality-alpn': 'Offer h2 and http/1.1 for Reality checks',
     'outbound-ip': 'Choose an already-assigned outbound IPv4 (optional)',
@@ -27,6 +31,9 @@ FEATURES = {
     'cdn-same-ip': 'Allow CDN domains resolving to this server',
     'direct-any-ip': 'Allow Direct domains resolving to another IP',
     'port-alias': 'Keep legacy client ports working (optional)',
+    'tcp-memory': 'RAM-aware aggregate TCP memory capacity',
+    'tcp-timewait': 'Raise the small TIME_WAIT capacity limit',
+    'rpxy-nodelay': 'Reduce small-message latency in rpxy TCP sockets',
 }
 # Exact replacements are constrained to the expected AST node and are independent.
 PATCHES = {
@@ -321,7 +328,7 @@ def units(install=True):
         '[Service]\n'+common+f'ExecStartPre=-+/usr/bin/python3 {helper} prepare\n',
         '[Unit]\nDescription=Repair enabled Hiddify Toolkit 2 features\n[Service]\nType=oneshot\nTimeoutStartSec=240\n'+common+f'ExecStart=/usr/bin/python3 {helper} reassert\n',
         '[Unit]\nDescription=Check Hiddify Toolkit 2 features every minute\n[Timer]\nOnBootSec=30s\nOnUnitActiveSec=60s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n',
-        '[Unit]\nDescription=Restore Hiddify Toolkit optional network rules\nAfter=network-online.target\nWants=network-online.target\nBefore=hiddify-haproxy.service\n[Service]\nType=oneshot\nRemainAfterExit=yes\n'+common+f'ExecStart=/usr/bin/python3 {helper} network-prepare\n[Install]\nWantedBy=multi-user.target\n',
+        '[Unit]\nDescription=Restore Hiddify Toolkit network and performance controls\nAfter=network-online.target systemd-sysctl.service\nWants=network-online.target\nBefore=hiddify-haproxy.service hiddify-rpxy-l4.service\n[Service]\nType=oneshot\nRemainAfterExit=yes\n'+common+f'ExecStart=/usr/bin/python3 {helper} network-prepare\n[Install]\nWantedBy=multi-user.target\n',
     ]
     changed = False
     for path, payload in zip(paths, payloads):
@@ -329,15 +336,16 @@ def units(install=True):
     if changed:
         run(['systemctl', 'daemon-reload'])
     run(['systemctl', 'enable', '--now', GUARD+'.timer'])
-    # A boot rule is needed only if an optional networking feature is enabled.
+    # Restore active networking/performance controls before the gateways start.
     conf = read_config()
-    run(['systemctl', 'enable' if any(f in conf['enabled'] for f in TABLES) else 'disable', BOOT+'.service'], check=False)
+    run(['systemctl', 'enable' if any(f in conf['enabled'] for f in (*TABLES, *performance.FEATURES)) else 'disable', BOOT+'.service'], check=False)
 
 
 def change(conf, old, install_units=True):
     # Invalid network inputs fail before any panel file or state is touched.
     validate_aliases(conf)
     validate_outbound(conf)
+    performance.preflight(conf, STATE)
     active = panel_active()
     prepared = False
     try:
@@ -345,6 +353,7 @@ def change(conf, old, install_units=True):
             changed = patch_files(conf)
             prepared = True
             network_sync(conf, validate=False)
+            performance.sync(conf, STATE, ROOT/'lib/toolkit.py')
             write_config(conf)
         if install_units:
             units()
@@ -355,7 +364,10 @@ def change(conf, old, install_units=True):
             with lock('files'):
                 reverted = patch_files(old)
                 network_sync(old, validate=False)
+                performance.sync(old, STATE, ROOT/'lib/toolkit.py')
                 write_config(old)
+            if install_units:
+                units()
             if active and (changed or reverted):
                 restart_panel()
         raise
@@ -371,15 +383,22 @@ def bootstrap():
     old = read_config()
     conf = json.loads(json.dumps(old))
     if not conf.get('initialized'):
-        conf['enabled'] = list(DEFAULTS)
+        conf['enabled'] = list(PANEL_DEFAULTS)
         conf['initialized'] = True
+    if not conf.get('performance_defaults_initialized'):
+        eligible, skipped = ([], {}) if os.environ.get('HT_SKIP_PERFORMANCE_DEFAULTS') == '1' else performance.eligible_defaults()
+        conf['enabled'] = sorted(set(conf['enabled']) | set(eligible))
+        conf['performance_defaults_initialized'] = True
+        conf['performance_defaults_skipped'] = skipped
+        for feature, reason in skipped.items():
+            print(f'{feature}: automatic default skipped: {reason}')
     try:
         change(conf, old)
     except Exception:
         if not old.get('initialized'):
             units(False)
         raise
-    print('Toolkit 2 installed: four built-in defaults; optional networking preserves its saved choices.')
+    print('Toolkit 2 installed: panel defaults and compatible performance defaults; saved choices preserved.')
 
 
 def reassert(prepare=False, network_only=False):
@@ -401,6 +420,7 @@ def reassert(prepare=False, network_only=False):
                     run(['nft', 'delete', 'table', family, table])
                 (STATE/'port-alias-receipt.json').unlink(missing_ok=True)
                 network_error = exc
+            performance.sync(conf, STATE, ROOT/'lib/toolkit.py')
     if changed and not prepare and panel_active():
         restart_panel()
     if network_error:
@@ -417,10 +437,12 @@ def status():
             if feature in PATCHES:
                 source = (package/PATCHES[feature][0]).read_text()
                 applied = transform(feature, source) == source
+            elif feature in performance.FEATURES and enabled:
+                applied = performance.status(feature, STATE)
             elif enabled:
                 receipt = STATE/(feature+'-receipt.json')
                 applied = receipt.exists() and json.loads(receipt.read_text()) == {'desired': network_script(feature, conf), 'live': table_text(feature)} and bool(table_text(feature))
-        except (ValueError, OSError):
+        except (ValueError, RuntimeError, OSError):
             pass
         state = 'APPLIED' if enabled and applied else 'DRIFTED' if enabled else 'OFF'
         print(f'{i}. {feature:18s} {state:8s} {title}')
@@ -429,6 +451,9 @@ def status():
         print('Saved aliases:', conf['aliases'])
     if conf['outbound']:
         print('Saved outbound:', conf['outbound']['ip'])
+    for feature, reason in conf.get('performance_defaults_skipped', {}).items():
+        if feature not in conf['enabled']:
+            print(f'{feature}: automatic default was unavailable: {reason}')
 
 
 def activate(feature, args):
@@ -437,6 +462,9 @@ def activate(feature, args):
         raise ValueError('Panel Apply/update is active; retry after it finishes')
     old = read_config()
     conf = json.loads(json.dumps(old))
+    if feature in performance.FEATURES:
+        conf['performance_defaults_initialized'] = True
+        conf.setdefault('performance_defaults_skipped', {}).pop(feature, None)
     if feature == 'port-alias':
         conf['aliases'] = parse_aliases(args.aliases or os.environ.get('PORT_ALIASES', ''))
     elif feature == 'outbound-ip':
@@ -467,6 +495,9 @@ def revert(feature):
         raise ValueError('Panel Apply/update is active; retry after it finishes')
     old = read_config()
     conf = json.loads(json.dumps(old))
+    if feature in performance.FEATURES:
+        conf['performance_defaults_initialized'] = True
+        conf.setdefault('performance_defaults_skipped', {}).pop(feature, None)
     conf['enabled'] = [f for f in conf['enabled'] if f != feature]
     change(conf, old)
     print(feature+': reverted; stays disabled on reinstall')
@@ -517,7 +548,7 @@ def menu():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', nargs='?', default='menu', choices=['menu','status','apply','revert','bootstrap','prepare','reassert','network-prepare','uninstall','version','update','preflight'])
+    parser.add_argument('command', nargs='?', default='menu', choices=['menu','status','apply','revert','bootstrap','prepare','reassert','network-prepare','performance-prepare','diagnose','uninstall','version','update','preflight'])
     parser.add_argument('feature', nargs='?', choices=list(FEATURES))
     parser.add_argument('--aliases')
     parser.add_argument('--ip')
@@ -532,6 +563,12 @@ def main():
     if os.geteuid() != 0:raise ValueError('Run as root')
     if args.command in ['apply','revert'] and not args.feature:parser.error('Specify a feature')
     if args.command == 'status':status();return
+    if args.command == 'diagnose':
+        print(json.dumps(performance.diagnose(), indent=2));return
+    if args.command == 'performance-prepare':
+        with lock('files'):
+            performance.sync(read_config(), STATE, ROOT/'lib/toolkit.py')
+        return
     if args.command == 'prepare':reassert(prepare=True);return
     # Panel ExecStartPre only takes the file lock, so a restart cannot deadlock this lock.
     if args.command == 'menu':

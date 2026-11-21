@@ -65,7 +65,7 @@ real packets in isolated namespaces; an additional provider-assigned production
 IP was not invented or attached to the server. The production choice remains off.
 
 No reboot was forced; the boot unit was exercised directly. No sustained capacity
-or peak-user load benchmark was performed. Toolkit 2 deliberately does not contain
+or peak-user load benchmark was performed. Toolkit 2.0 deliberately did not contain
 performance, IPv6-control, WARP, ECH, log-capping or dashboard modules.
 
 The panel's existing Granian service took around 90 seconds to stop. An initial
@@ -87,3 +87,61 @@ missing-channel refusal and invalid/API-error response refusal. The default
 installer now selects a published stable v2 release, never unreleased main,
 v1 releases, other major releases, drafts or prereleases. Source VERSION must
 belong to v2 and match an explicitly selected v2 tag. ShellCheck and diff checks pass.
+
+## Performance release: 2.1.0
+
+Validated on **2026-11-22**, Hiddify Manager/Panel **14.2.0**, Ubuntu **26.04.1**,
+kernel **7.0.0-30-generic**, x86_64, four vCPU and approximately 7.56 GiB RAM.
+An additional isolated NODELAY compatibility test passed on an Ubuntu **24.04**
+host running kernel **6.8.0-149-generic**, also x86_64. Native ARM64 builds are
+capability gated but were not live validated in this acceptance run.
+
+- **35 unit tests pass.** New coverage includes page-size/RAM budgets, larger
+  pre-existing values, independent revert, preservation of externally changed
+  runtime values, sysctl/BPF failure rollback, missing ownership receipts,
+  pending boot attachment, existing-socket repair, cached-helper architecture,
+  unavailable capability fallback, 2.0.x default migration and persisted opt-out.
+- The existing **10 real-packet namespace tests** pass on the Ubuntu 26 host.
+  They leave production interfaces/routes/firewalls unchanged. Controlled tests
+  of the installed panel TLS function accept HTTP/1.1 and h2 with TLS 1.3,
+  while still rejecting TLS 1.2.
+- On both kernels, an isolated owned cgroup demonstrates new active/passive TCP
+  NODELAY values `0 -> 1 -> 0`, idempotent attach and complete detach/cleanup.
+  Production rpxy is never moved into the diagnostic cgroup.
+- The canary install enabled the four panel defaults plus all three performance
+  defaults. TCP memory changed from `25600 51200 102400` pages to
+  `123848 185772 247697` pages, calculated using actual RAM and 4096-byte pages.
+  TIME_WAIT capacity changed from 5000 to 262144. The locally-built helper updated
+  729 established rpxy sockets; a later complete scan found 691 on and zero off.
+- In matched 20-second aggregate windows, `TCPTimeWaitOverflow` changed from
+  **2349 to 0**. TCP receive/OFO/backlog/listen drops remained zero. These are
+  bounded production observations, not peak-capacity guarantees.
+- Authenticated REALITY downloads from an Iranian physical-interface vantage
+  completed on both direct and relay paths using the existing configured port.
+  For three 1 MiB downloads per path, direct median time was approximately
+  **1.20 -> 1.11 s**, and relay median **2.05 -> 1.71 s**. The before relay samples
+  included a 6.54-second outlier; changing user load and network conditions are
+  confounders, so throughput gains are not attributed exclusively to tuning.
+- For eight reused HTTP/2 requests per path, body-after-headers pauses above
+  80 ms changed from **3/16 to 0/16**. Maximum observed body gaps changed from
+  about 105/165 ms (direct/relay) to less than 1/4 ms. Overall median request time
+  was 119 -> 109 ms direct and 172 -> 176 ms relay; the relay median did not improve.
+- The native generated config hashes, domain-port records and stateless nftables
+  ruleset were identical before/after installation. rpxy, Xray, HAProxy and
+  hiddify-core PIDs were unchanged. The panel restarted once for source defaults.
+- The enabled boot entry and an ordinary reassert completed successfully without
+  proxy restarts. `systemd-analyze verify` accepted the boot, guard, timer and rpxy
+  units. Effective systemd-sysctl ordering selected the owned performance values.
+
+No reboot or production rpxy restart was forced to test future startup behavior.
+Failure rollback is exercised with isolated state/runtime substitutes; no known
+bad capacity limit was deliberately reintroduced on the live canary. NODELAY
+detach/new-socket restoration is exercised with real sockets in private cgroups.
+Existing connected sockets keep NODELAY until natural closure on revert.
+
+The performance profile does not change qdisc, congestion control, MTU/MSS,
+offloads, RPS/IRQ assignment, TCP timeouts, conntrack capacity or application ports.
+The canary NIC had no observed queue drops, and its busiest sampled CPU was
+approximately 37%, so no evidence justified those additional changes.
+Current-kernel parameter semantics were checked against the
+[Linux 7.0 IP sysctl documentation](https://github.com/torvalds/linux/blob/v7.0/Documentation/networking/ip-sysctl.rst).
